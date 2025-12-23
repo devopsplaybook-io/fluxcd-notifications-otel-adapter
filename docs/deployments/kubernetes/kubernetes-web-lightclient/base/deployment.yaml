@@ -1,0 +1,52 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: fluxcd-notifications-otel-adapter
+  labels:
+    app: fluxcd-notifications-otel-adapter
+spec:
+  replicas: 1
+  revisionHistoryLimit: 1
+  selector:
+    matchLabels:
+      app: fluxcd-notifications-otel-adapter
+  template:
+    metadata:
+      labels:
+        app: fluxcd-notifications-otel-adapter
+    spec:
+      serviceAccountName: fluxcd-notifications-otel-adapter-role
+      containers:
+        - image: fluxcd-notifications-otel-adapter
+          name: fluxcd-notifications-otel-adapter
+          env:
+            - name: APPLICATION_TITLE
+              value: Kubernetes
+          resources:
+            limits:
+              memory: 500Mi
+              cpu: 1
+            requests:
+              memory: 20Mi
+              cpu: 100m
+          volumeMounts:
+            - mountPath: /data
+              name: pod-volume
+            - name: config-volume
+              mountPath: /opt/app/fluxcd-notifications-otel-adapter/config.json
+              subPath: config.json
+          imagePullPolicy: Always
+          readinessProbe:
+            httpGet:
+              path: /api/status
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            failureThreshold: 3
+      volumes:
+        - name: pod-volume
+          persistentVolumeClaim:
+            claimName: fluxcd-notifications-otel-adapter
+        - name: config-volume
+          configMap:
+            name: fluxcd-notifications-otel-adapter-config

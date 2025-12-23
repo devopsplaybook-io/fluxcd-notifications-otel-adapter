@@ -1,0 +1,18 @@
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: fluxcd-notifications-otel-adapter-role
+subjects:
+  - kind: ServiceAccount
+    name: fluxcd-notifications-otel-adapter-role
+    namespace: fluxcd-notifications-otel-adapter
+roleRef:
+  kind: ClusterRole
+  name: cluster-admin
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: fluxcd-notifications-otel-adapter-role

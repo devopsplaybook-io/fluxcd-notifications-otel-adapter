@@ -1,0 +1,6 @@
+kind: Namespace
+apiVersion: v1
+metadata:
+  name: fluxcd-notifications-otel-adapter
+  labels:
+    name: fluxcd-notifications-otel-adapter

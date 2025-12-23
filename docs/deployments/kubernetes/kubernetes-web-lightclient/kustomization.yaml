@@ -1,0 +1,14 @@
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: fluxcd-notifications-otel-adapter
+resources:
+  - base/namespace.yaml
+  - base/pvc.yaml
+  - base/deployment.yaml
+  - base/service.yaml
+  - base/rbac.yaml
+  - base/configmap.yaml
+images:
+  - name: fluxcd-notifications-otel-adapter
+    newTag: latest
+    newName: devopsplaybookio/fluxcd-notifications-otel-adapter
