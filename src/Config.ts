@@ -1,6 +1,5 @@
 import { ConfigOTelInterface } from "@devopsplaybook.io/otel-utils";
 import * as fse from "fs-extra";
-import { v4 as uuidv4 } from "uuid";
 import { OTelLogger } from "./OTelContext";
 import path from "path";
 
@@ -9,7 +8,7 @@ const logger = OTelLogger().createModuleLogger("config");
 export class Config implements ConfigOTelInterface {
   //
   public readonly CONFIG_FILE: string = "config.json";
-  public readonly SERVICE_ID = "fluxcd-notifications";
+  public SERVICE_ID = "fluxcd-notifications";
   public VERSION = "1";
   public readonly API_PORT: number = 8080;
   public JWT_VALIDITY_DURATION: number = 3 * 31 * 24 * 3600;
@@ -62,6 +61,7 @@ export class Config implements ConfigOTelInterface {
     };
     logger.info(`Configuration Value: CONFIG_FILE: ${this.CONFIG_FILE}`);
     logger.info(`Configuration Value: VERSION: ${this.VERSION}`);
+    setIfSet("SERVICE_ID");
     setIfSet("JWT_VALIDITY_DURATION");
     setIfSet("CORS_POLICY_ORIGIN");
     setIfSet("DATA_DIR");
