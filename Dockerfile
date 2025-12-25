@@ -18,6 +18,7 @@ COPY entrypoint.sh /entrypoint.sh
 
 COPY --from=builder /opt/src/node_modules /opt/app/node_modules
 COPY --from=builder /opt/src/dist /opt/app/dist
+COPY config.json /opt/app/config.json
 COPY package.json /opt/app/package.json
 
 WORKDIR /opt/app
