@@ -53,10 +53,34 @@ Promise.resolve().then(async () => {
     return { started: true };
   });
 
+  const fluxtLogger = OTelLogger().createModuleLogger("fluxcd-notifications");
+
   fastify.setNotFoundHandler((request, reply) => {
     console.log("Method:", request.method);
     console.log("URL:", request.url);
     console.log("Body:", request.body);
+    const requestFlux = request as {
+      url?: string;
+      method?: string;
+      body?: {
+        message?: string;
+        reason?: string;
+        metadata?: { cluster?: string };
+      };
+    };
+    if (
+      requestFlux.url === "/" &&
+      requestFlux.method === "POST" &&
+      requestFlux.body?.message &&
+      requestFlux.body?.reason &&
+      requestFlux.body?.metadata?.cluster
+    ) {
+      fluxtLogger.info(
+        `${requestFlux.body.metadata.cluster}: ${requestFlux.body.reason} - ${requestFlux.body.message}`
+      );
+      reply.status(200).send({ status: "ok" });
+      return;
+    }
     reply.status(404).send({ error: "Not Found" });
   });
 

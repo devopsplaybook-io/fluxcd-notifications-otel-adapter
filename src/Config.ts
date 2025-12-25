@@ -9,7 +9,7 @@ const logger = OTelLogger().createModuleLogger("config");
 export class Config implements ConfigOTelInterface {
   //
   public readonly CONFIG_FILE: string = "config.json";
-  public readonly SERVICE_ID = "fluxcd-notifications-otel-adapter-server";
+  public readonly SERVICE_ID = "fluxcd-notifications";
   public VERSION = "1";
   public readonly API_PORT: number = 8080;
   public JWT_VALIDITY_DURATION: number = 3 * 31 * 24 * 3600;
