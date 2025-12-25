@@ -22,4 +22,4 @@ COPY package.json /opt/app/package.json
 
 WORKDIR /opt/app
 
-ENTRYPOINT [ "node dist/App.js" ]
+CMD ["dist/App.js"]
