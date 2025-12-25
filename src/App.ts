@@ -54,7 +54,9 @@ Promise.resolve().then(async () => {
   });
 
   fastify.setNotFoundHandler((request, reply) => {
-    console.log(request);
+    console.log("Method:", request.method);
+    console.log("URL:", request.url);
+    console.log("Body:", request.body);
     reply.status(404).send({ error: "Not Found" });
   });
 
