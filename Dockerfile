@@ -1,5 +1,5 @@
 # BUILD
-FROM node:22-alpine as builder
+FROM node:24-alpine as builder
 
 WORKDIR /opt/src
 
@@ -12,9 +12,7 @@ RUN npm ci && \
 
 
 # RUN
-FROM node:22-alpine
-
-COPY entrypoint.sh /entrypoint.sh
+FROM node:24-alpine
 
 COPY --from=builder /opt/src/node_modules /opt/app/node_modules
 COPY --from=builder /opt/src/dist /opt/app/dist

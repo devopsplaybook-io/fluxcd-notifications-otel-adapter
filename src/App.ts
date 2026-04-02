@@ -9,7 +9,6 @@ import {
   OTelSetTracer,
   OTelTracer,
 } from "./OTelContext";
-import { FlucCDRoutes } from "./fluxcd/FlucCDRoutes";
 
 const logger = OTelLogger().createModuleLogger("app");
 
@@ -29,7 +28,6 @@ Promise.resolve().then(async () => {
   OTelLogger().initOTel(config);
 
   const span = OTelTracer().startSpan("init");
-
   span.end();
 
   // API
@@ -38,15 +36,8 @@ Promise.resolve().then(async () => {
     logger: config.LOG_LEVEL === process.env.FASTIFY_LOG_LEVEL,
   });
 
-  /* eslint-disable-next-line */
-  fastify.register(require("@fastify/multipart"));
-
   StandardTracerFastifyRegisterHooks(fastify, OTelTracer(), OTelLogger(), {
     ignoreList: ["GET-/api/status"],
-  });
-
-  fastify.register(new FlucCDRoutes().getRoutes, {
-    prefix: "/api/fluxcd",
   });
 
   fastify.get("/api/status", async () => {
@@ -55,33 +46,20 @@ Promise.resolve().then(async () => {
 
   const fluxtLogger = OTelLogger().createModuleLogger("fluxcd-notifications");
 
-  fastify.setNotFoundHandler((request, reply) => {
-    console.log("Method:", request.method);
-    console.log("URL:", request.url);
-    console.log("Body:", request.body);
-    const requestFlux = request as {
-      url?: string;
-      method?: string;
-      body?: {
-        message?: string;
-        reason?: string;
-        metadata?: { cluster?: string };
-      };
+  fastify.post("/", async (request, reply) => {
+    const body = request.body as {
+      message?: string;
+      reason?: string;
+      metadata?: { cluster?: string };
     };
-    if (
-      requestFlux.url === "/" &&
-      requestFlux.method === "POST" &&
-      requestFlux.body?.message &&
-      requestFlux.body?.reason &&
-      requestFlux.body?.metadata?.cluster
-    ) {
+    if (body?.message && body?.reason && body?.metadata?.cluster) {
       fluxtLogger.info(
-        `${requestFlux.body.metadata.cluster}: ${requestFlux.body.reason} - ${requestFlux.body.message}`
+        `${body.metadata.cluster}: ${body.reason} - ${body.message}`,
       );
       reply.status(200).send({ status: "ok" });
       return;
     }
-    reply.status(404).send({ error: "Not Found" });
+    reply.status(400).send({ error: "Bad Request" });
   });
 
   fastify.listen({ port: config.API_PORT, host: "0.0.0.0" }, (err) => {

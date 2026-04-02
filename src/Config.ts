@@ -8,14 +8,10 @@ const logger = OTelLogger().createModuleLogger("config");
 export class Config implements ConfigOTelInterface {
   //
   public readonly CONFIG_FILE: string = "config.json";
-  public SERVICE_ID = "fluxcd-notifications";
+  public readonly SERVICE_ID = "fluxcd-notifications";
   public VERSION = "1";
   public readonly API_PORT: number = 8080;
-  public JWT_VALIDITY_DURATION: number = 3 * 31 * 24 * 3600;
-  public CORS_POLICY_ORIGIN: string;
   public LOG_LEVEL = "info";
-  public STATS_FETCH_FREQUENCY = 60;
-  public STATS_RETENTION = 60 * 60 * 24;
   public OPENTELEMETRY_COLLECTOR_HTTP_TRACES = "";
   public OPENTELEMETRY_COLLECTOR_HTTP_METRICS = "";
   public OPENTELEMETRY_COLLECTOR_HTTP_LOGS = "";
@@ -42,33 +38,28 @@ export class Config implements ConfigOTelInterface {
     const content = await fse.readJson(this.CONFIG_FILE);
     const setIfSet = (field: string, displayLog = true) => {
       let fromEnv = "defaults";
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const self = this as Record<string, any>;
       if (process.env[field]) {
-        this[field] = process.env[field];
+        self[field] = process.env[field];
         fromEnv = "environment";
-      } else if (content[field]) {
-        this[field] = content[field];
+      } else if (content[field] !== undefined) {
+        self[field] = content[field];
         fromEnv = "config";
       }
       if (displayLog) {
         logger.info(
-          `Configuration Value: ${field}: ${this[field]} (from ${fromEnv})`
+          `Configuration Value: ${field}: ${self[field]} (from ${fromEnv})`,
         );
       } else {
         logger.info(
-          `Configuration Value: ${field}: ******************** (from ${fromEnv})`
+          `Configuration Value: ${field}: ******************** (from ${fromEnv})`,
         );
       }
     };
     logger.info(`Configuration Value: CONFIG_FILE: ${this.CONFIG_FILE}`);
     logger.info(`Configuration Value: VERSION: ${this.VERSION}`);
-    setIfSet("SERVICE_ID");
-    setIfSet("JWT_VALIDITY_DURATION");
-    setIfSet("CORS_POLICY_ORIGIN");
-    setIfSet("DATA_DIR");
-    setIfSet("JWT_KEY", false);
     setIfSet("LOG_LEVEL");
-    setIfSet("STATS_FETCH_FREQUENCY");
-    setIfSet("STATS_RETENTION");
     setIfSet("OPENTELEMETRY_COLLECTOR_HTTP_TRACES");
     setIfSet("OPENTELEMETRY_COLLECTOR_HTTP_METRICS");
     setIfSet("OPENTELEMETRY_COLLECTOR_HTTP_LOGS");
