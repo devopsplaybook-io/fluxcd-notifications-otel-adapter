@@ -33,9 +33,7 @@ Promise.resolve().then(async () => {
   // API
 
   const fastify = Fastify({
-    logger: {
-      level: "error",
-    },
+    logger: config.LOG_LEVEL === process.env.FASTIFY_LOG_LEVEL,
   });
 
   StandardTracerFastifyRegisterHooks(fastify, OTelTracer(), OTelLogger(), {
