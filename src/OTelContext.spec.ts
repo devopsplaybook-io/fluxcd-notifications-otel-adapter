@@ -142,7 +142,7 @@ describe("OTelContext", () => {
   describe("OTelRequestSpan", () => {
     it("should retrieve the tracerSpanApi from the request object", () => {
       const mockSpan = { end: jest.fn() };
-      const req = { tracerSpanApi: mockSpan };
+      const req = { tracerSpanApi: mockSpan as any };
       expect(OTelRequestSpan(req)).toBe(mockSpan);
     });
 
