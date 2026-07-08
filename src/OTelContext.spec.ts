@@ -1,22 +1,22 @@
-// Mock external OTel utils before importing
-const mockStartSpan = jest.fn() as jest.Mock<() => { end: () => void }>;
-const mockCreateCounter = jest.fn();
+// Mock common-utils before any imports
+const mockOTelSetTracer = jest.fn();
+const mockOTelTracer = jest.fn();
+const mockOTelSetMeter = jest.fn();
+const mockOTelMeter = jest.fn();
+const mockOTelLogger = jest.fn();
+const mockOTelRequestSpan = jest.fn();
 
-jest.mock("@devopsplaybook.io/otel-utils", () => ({
-  StandardLogger: jest.fn().mockImplementation(() => ({
-    createModuleLogger: jest.fn(),
-    initOTel: jest.fn(),
-    getLogger: jest.fn(),
-  })),
-  StandardTracer: jest.fn().mockImplementation(() => ({
-    startSpan: mockStartSpan,
-  })),
-  StandardMeter: jest.fn().mockImplementation(() => ({
-    createCounter: mockCreateCounter,
+jest.mock("@devopsplaybook.io/common-utils", () => ({
+  createOTelContext: jest.fn(() => ({
+    OTelSetTracer: mockOTelSetTracer,
+    OTelTracer: mockOTelTracer,
+    OTelSetMeter: mockOTelSetMeter,
+    OTelMeter: mockOTelMeter,
+    OTelLogger: mockOTelLogger,
+    OTelRequestSpan: mockOTelRequestSpan,
   })),
 }));
 
-import { StandardMeter, StandardTracer } from "@devopsplaybook.io/otel-utils";
 import {
   OTelSetTracer,
   OTelTracer,
@@ -31,125 +31,68 @@ describe("OTelContext", () => {
     jest.clearAllMocks();
   });
 
+  it("should create an OTelContext at module load", () => {
+    // The exports are wired up during module load, proving createOTelContext was called
+    expect(OTelSetTracer).toBeDefined();
+    expect(OTelTracer).toBeDefined();
+    expect(OTelSetMeter).toBeDefined();
+    expect(OTelMeter).toBeDefined();
+    expect(OTelLogger).toBeDefined();
+    expect(OTelRequestSpan).toBeDefined();
+  });
+
+  describe("OTelSetTracer", () => {
+    it("should delegate to the context OTelSetTracer", () => {
+      const tracer = { id: "tracer1" };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      OTelSetTracer(tracer as any);
+      expect(mockOTelSetTracer).toHaveBeenCalledWith(tracer);
+    });
+  });
+
+  describe("OTelTracer", () => {
+    it("should delegate to the context OTelTracer", () => {
+      const expected = { id: "tracer1" };
+      mockOTelTracer.mockReturnValueOnce(expected);
+      expect(OTelTracer()).toBe(expected);
+    });
+  });
+
+  describe("OTelSetMeter", () => {
+    it("should delegate to the context OTelSetMeter", () => {
+      const meter = { id: "meter1" };
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      OTelSetMeter(meter as any);
+      expect(mockOTelSetMeter).toHaveBeenCalledWith(meter);
+    });
+  });
+
+  describe("OTelMeter", () => {
+    it("should delegate to the context OTelMeter", () => {
+      const expected = { id: "meter1" };
+      mockOTelMeter.mockReturnValueOnce(expected);
+      expect(OTelMeter()).toBe(expected);
+    });
+  });
+
   describe("OTelLogger", () => {
-    it("should create a new StandardLogger on first call", () => {
-      const logger = OTelLogger();
-      expect(logger).toBeDefined();
-      expect(logger.createModuleLogger).toBeDefined();
-      expect(logger.initOTel).toBeDefined();
-      expect(logger.getLogger).toBeDefined();
-    });
-
-    it("should return the same logger instance on subsequent calls", () => {
-      const logger1 = OTelLogger();
-      const logger2 = OTelLogger();
-      expect(logger1).toBe(logger2);
-    });
-  });
-
-  describe("OTelSetTracer / OTelTracer", () => {
-    it("should set and retrieve a tracer", () => {
-      const tracer = new StandardTracer({
-        SERVICE_ID: "test",
-        VERSION: "1",
-        OPENTELEMETRY_COLLECTOR_HTTP_TRACES: "",
-        OPENTELEMETRY_COLLECTOR_HTTP_METRICS: "",
-        OPENTELEMETRY_COLLECTOR_HTTP_LOGS: "",
-        OPENTELEMETRY_COLLECTOR_EXPORT_LOGS_INTERVAL_SECONDS: 60,
-        OPENTELEMETRY_COLLECTOR_EXPORT_METRICS_INTERVAL_SECONDS: 60,
-        OPENTELEMETRY_COLLECTOR_AWS: false,
-        OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER: "",
-      });
-      OTelSetTracer(tracer);
-      expect(OTelTracer()).toBe(tracer);
-    });
-
-    it("should overwrite a previously set tracer", () => {
-      const tracer1 = new StandardTracer({
-        SERVICE_ID: "test",
-        VERSION: "1",
-        OPENTELEMETRY_COLLECTOR_HTTP_TRACES: "",
-        OPENTELEMETRY_COLLECTOR_HTTP_METRICS: "",
-        OPENTELEMETRY_COLLECTOR_HTTP_LOGS: "",
-        OPENTELEMETRY_COLLECTOR_EXPORT_LOGS_INTERVAL_SECONDS: 60,
-        OPENTELEMETRY_COLLECTOR_EXPORT_METRICS_INTERVAL_SECONDS: 60,
-        OPENTELEMETRY_COLLECTOR_AWS: false,
-        OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER: "",
-      });
-      const tracer2 = new StandardTracer({
-        SERVICE_ID: "test2",
-        VERSION: "2",
-        OPENTELEMETRY_COLLECTOR_HTTP_TRACES: "",
-        OPENTELEMETRY_COLLECTOR_HTTP_METRICS: "",
-        OPENTELEMETRY_COLLECTOR_HTTP_LOGS: "",
-        OPENTELEMETRY_COLLECTOR_EXPORT_LOGS_INTERVAL_SECONDS: 60,
-        OPENTELEMETRY_COLLECTOR_EXPORT_METRICS_INTERVAL_SECONDS: 60,
-        OPENTELEMETRY_COLLECTOR_AWS: false,
-        OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER: "",
-      });
-      OTelSetTracer(tracer1);
-      OTelSetTracer(tracer2);
-      expect(OTelTracer()).toBe(tracer2);
-    });
-  });
-
-  describe("OTelSetMeter / OTelMeter", () => {
-    it("should set and retrieve a meter", () => {
-      const meter = new StandardMeter({
-        SERVICE_ID: "test",
-        VERSION: "1",
-        OPENTELEMETRY_COLLECTOR_HTTP_TRACES: "",
-        OPENTELEMETRY_COLLECTOR_HTTP_METRICS: "",
-        OPENTELEMETRY_COLLECTOR_HTTP_LOGS: "",
-        OPENTELEMETRY_COLLECTOR_EXPORT_LOGS_INTERVAL_SECONDS: 60,
-        OPENTELEMETRY_COLLECTOR_EXPORT_METRICS_INTERVAL_SECONDS: 60,
-        OPENTELEMETRY_COLLECTOR_AWS: false,
-        OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER: "",
-      });
-      OTelSetMeter(meter);
-      expect(OTelMeter()).toBe(meter);
-    });
-
-    it("should overwrite a previously set meter", () => {
-      const meter1 = new StandardMeter({
-        SERVICE_ID: "test",
-        VERSION: "1",
-        OPENTELEMETRY_COLLECTOR_HTTP_TRACES: "",
-        OPENTELEMETRY_COLLECTOR_HTTP_METRICS: "",
-        OPENTELEMETRY_COLLECTOR_HTTP_LOGS: "",
-        OPENTELEMETRY_COLLECTOR_EXPORT_LOGS_INTERVAL_SECONDS: 60,
-        OPENTELEMETRY_COLLECTOR_EXPORT_METRICS_INTERVAL_SECONDS: 60,
-        OPENTELEMETRY_COLLECTOR_AWS: false,
-        OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER: "",
-      });
-      const meter2 = new StandardMeter({
-        SERVICE_ID: "test2",
-        VERSION: "2",
-        OPENTELEMETRY_COLLECTOR_HTTP_TRACES: "",
-        OPENTELEMETRY_COLLECTOR_HTTP_METRICS: "",
-        OPENTELEMETRY_COLLECTOR_HTTP_LOGS: "",
-        OPENTELEMETRY_COLLECTOR_EXPORT_LOGS_INTERVAL_SECONDS: 60,
-        OPENTELEMETRY_COLLECTOR_EXPORT_METRICS_INTERVAL_SECONDS: 60,
-        OPENTELEMETRY_COLLECTOR_AWS: false,
-        OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER: "",
-      });
-      OTelSetMeter(meter1);
-      OTelSetMeter(meter2);
-      expect(OTelMeter()).toBe(meter2);
+    it("should delegate to the context OTelLogger", () => {
+      const expected = { info: jest.fn() };
+      mockOTelLogger.mockReturnValueOnce(expected);
+      expect(OTelLogger()).toBe(expected);
     });
   });
 
   describe("OTelRequestSpan", () => {
-    it("should retrieve the tracerSpanApi from the request object", () => {
-      const mockSpan = { end: jest.fn() };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const req = { tracerSpanApi: mockSpan as any };
-      expect(OTelRequestSpan(req)).toBe(mockSpan);
+    it("should delegate to the context OTelRequestSpan", () => {
+      const req = { tracerSpanApi: { end: jest.fn() } };
+      mockOTelRequestSpan.mockReturnValueOnce(req.tracerSpanApi);
+      expect(OTelRequestSpan(req)).toBe(req.tracerSpanApi);
     });
 
-    it("should return undefined when request has no tracerSpanApi", () => {
-      const req = {};
-      expect(OTelRequestSpan(req)).toBeUndefined();
+    it("should return undefined when request has no span", () => {
+      mockOTelRequestSpan.mockReturnValueOnce(undefined);
+      expect(OTelRequestSpan({})).toBeUndefined();
     });
   });
 });
