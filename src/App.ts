@@ -54,6 +54,9 @@ Promise.resolve().then(async () => {
       fluxtLogger.info(
         `${body.metadata.cluster}: ${body.reason} - ${body.message}`,
       );
+      console.log("TEST");
+      console.log(body.message);
+      console.log("TEST2");
       reply.status(200).send({ status: "ok" });
       return;
     }
