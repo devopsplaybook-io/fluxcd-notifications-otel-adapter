@@ -23,10 +23,10 @@ fluxcd-notifications-otel-adapter/
 
 - **Language**: TypeScript (strict mode off, ES6 target, CommonJS modules)
 - **Runtime**: Node.js 26
-- **Build**: `tsc` compiles `src/` to `dist/` (with `skipLibCheck: true`)
-- **Dev mode**: `ts-node-dev ./src/App.ts`
-- **Tests**: Jest with `ts-jest`, spec files named `*.spec.ts` alongside source, run with `npm test`
-- **Linting**: ESLint with `typescript-eslint` (strict + stylistic configs)
+- **Build**: `tsc` compiles `src/` to `dist/` (with `skipLibCheck: true`), then type-checks the spec files (`tsc -p tsconfig.spec.json --noEmit`)
+- **Dev mode**: `tsx watch ./src/App.ts`
+- **Tests**: Jest with `@swc/jest` (v8 coverage provider), spec files named `*.spec.ts` alongside source, run with `npm test`
+- **Linting**: oxlint (recommended preset)
 - **Config loading**: `Config` extends `ConfigBase` from `@devopsplaybook.io/common-utils`; env vars override config.json which overrides defaults
 - **Secrets in logs**: Sensitive config values (authorization headers, keys) are masked as `********************` by `ConfigBase.reload()`
 
@@ -104,7 +104,7 @@ After any code change, run:
 
 ```bash
 npm run build    # TypeScript compilation
-npm run lint     # ESLint check
+npm run lint     # oxlint check
 npm test         # Jest tests with coverage
 ```
 
