@@ -40,7 +40,9 @@ jest.mock("@devopsplaybook.io/common-utils", () => ({
   },
 }));
 
-import { Config } from "./Config";
+// swc hoists static imports above the mock declarations, so load the module
+// under test with an in-place require after jest.mock registration.
+const { Config } = require("./Config");
 
 describe("Config", () => {
   beforeEach(() => {

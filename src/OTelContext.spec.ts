@@ -17,14 +17,16 @@ jest.mock("@devopsplaybook.io/common-utils", () => ({
   })),
 }));
 
-import {
+// swc hoists static imports above the mock declarations, so load the module
+// under test with an in-place require after jest.mock registration.
+const {
   OTelSetTracer,
   OTelTracer,
   OTelSetMeter,
   OTelMeter,
   OTelLogger,
   OTelRequestSpan,
-} from "./OTelContext";
+} = require("./OTelContext");
 
 describe("OTelContext", () => {
   beforeEach(() => {
@@ -44,7 +46,6 @@ describe("OTelContext", () => {
   describe("OTelSetTracer", () => {
     it("should delegate to the context OTelSetTracer", () => {
       const tracer = { id: "tracer1" };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       OTelSetTracer(tracer as any);
       expect(mockOTelSetTracer).toHaveBeenCalledWith(tracer);
     });
@@ -61,7 +62,6 @@ describe("OTelContext", () => {
   describe("OTelSetMeter", () => {
     it("should delegate to the context OTelSetMeter", () => {
       const meter = { id: "meter1" };
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
       OTelSetMeter(meter as any);
       expect(mockOTelSetMeter).toHaveBeenCalledWith(meter);
     });
