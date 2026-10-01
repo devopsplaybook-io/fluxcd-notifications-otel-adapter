@@ -1,6 +1,6 @@
 {
   "name": "fluxcd-notifications-otel-adapter",
-  "version": "0.4.0",
+  "version": "0.4.7",
   "author": "",
   "license": "MIT",
   "scripts": {
@@ -37,7 +37,7 @@
     "@types/fs-extra": "^11.0.4",
     "@types/jest": "^30.0.0",
     "@types/lodash": "^4.17.25",
-    "@types/node": "^26.4.1",
+    "@types/node": "^26.6.3",
     "jest": "^30.5.1",
     "oxlint": "^1.83.0",
     "sinon": "^22.1.0",
