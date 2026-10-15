@@ -3,6 +3,7 @@ import { StandardTracerFastifyRegisterHooks } from "@devopsplaybook.io/otel-util
 import Fastify from "fastify";
 import { watchFile } from "fs-extra";
 import { Config } from "./Config";
+import { registerRoutes } from "./AppRoutes";
 import {
   OTelLogger,
   OTelSetMeter,
@@ -34,31 +35,14 @@ Promise.resolve().then(async () => {
 
   const fastify = Fastify({});
 
+  // rootApiPath "/" is required so webhook requests to POST / are traced:
+  // the hooks default to "/api" and silently skip everything outside it.
   StandardTracerFastifyRegisterHooks(fastify, OTelTracer(), OTelLogger(), {
+    rootApiPath: "/",
     ignoreList: ["GET-/api/status"],
   });
 
-  fastify.get("/api/status", async () => {
-    return { started: true };
-  });
-
-  const fluxtLogger = OTelLogger().createModuleLogger("fluxcd-notifications");
-
-  fastify.post("/", async (request, reply) => {
-    const body = request.body as {
-      message?: string;
-      reason?: string;
-      metadata?: { cluster?: string };
-    };
-    if (body?.message && body?.reason && body?.metadata?.cluster) {
-      fluxtLogger.info(
-        `${body.metadata.cluster}: ${body.reason} - ${body.message}`,
-      );
-      reply.status(200).send({ status: "ok" });
-      return;
-    }
-    reply.status(400).send({ error: "Bad Request" });
-  });
+  registerRoutes(fastify, config);
 
   fastify.listen({ port: config.API_PORT, host: "0.0.0.0" }, (err) => {
     if (err) {

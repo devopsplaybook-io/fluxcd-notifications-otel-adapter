@@ -10,9 +10,10 @@ jest.mock("./OTelContext", () => ({
   })),
 }));
 
-// Track constructor and reload calls on ConfigBase
+// Track constructor, addConfigField and reload calls on ConfigBase
 const mockReload = jest.fn().mockResolvedValue(undefined);
 let capturedServiceId: string | undefined;
+let capturedConfigFields: Array<{ field: string; sensitive?: boolean }> = [];
 
 jest.mock("@devopsplaybook.io/common-utils", () => ({
   ConfigBase: class MockConfigBase {
@@ -34,6 +35,10 @@ jest.mock("@devopsplaybook.io/common-utils", () => ({
       this.SERVICE_ID = serviceId;
     }
 
+    addConfigField(def: { field: string; sensitive?: boolean }): void {
+      capturedConfigFields.push(def);
+    }
+
     async reload(logger?: (message: string) => void): Promise<void> {
       return mockReload(logger);
     }
@@ -43,11 +48,13 @@ jest.mock("@devopsplaybook.io/common-utils", () => ({
 // swc hoists static imports above the mock declarations, so load the module
 // under test with an in-place require after jest.mock registration.
 const { Config } = require("./Config");
+const { version: packageVersion } = require("../package.json");
 
 describe("Config", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     capturedServiceId = undefined;
+    capturedConfigFields = [];
   });
 
   describe("constructor", () => {
@@ -65,6 +72,24 @@ describe("Config", () => {
       expect(config.OPENTELEMETRY_COLLECTOR_HTTP_METRICS).toBe("");
       expect(config.OPENTELEMETRY_COLLECTOR_HTTP_LOGS).toBe("");
       expect(config.OPENTELEMETRY_COLLECTOR_AWS).toBe(false);
+    });
+
+    it("should default WEBHOOK_AUTHORIZATION_HEADER to empty", () => {
+      const config = new Config();
+      expect(config.WEBHOOK_AUTHORIZATION_HEADER).toBe("");
+    });
+
+    it("should register WEBHOOK_AUTHORIZATION_HEADER as a sensitive config field", () => {
+      new Config();
+      expect(capturedConfigFields).toContainEqual({
+        field: "WEBHOOK_AUTHORIZATION_HEADER",
+        sensitive: true,
+      });
+    });
+
+    it("should override VERSION with the application package.json version", () => {
+      const config = new Config();
+      expect(config.VERSION).toBe(packageVersion);
     });
   });
 

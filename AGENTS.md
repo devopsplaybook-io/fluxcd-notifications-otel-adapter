@@ -9,10 +9,11 @@ A lightweight TypeScript server that receives FluxCD notification webhooks and f
 ```
 fluxcd-notifications-otel-adapter/
   src/
-    App.ts              # Entry point: Fastify server, route registration, OTel init
+    App.ts              # Entry point: Fastify server, OTel init, hooks registration
+    AppRoutes.ts        # Route registration: status endpoint, Flux webhook forwarding
     Config.ts           # Extends ConfigBase from @devopsplaybook.io/common-utils
     OTelContext.ts       # Re-exports createOTelContext from common-utils
-    App.spec.ts         # Route integration tests (Fastify inject)
+    App.spec.ts         # Route integration tests (Fastify inject on registerRoutes)
     Config.spec.ts      # Config construction and reload delegation tests
     OTelContext.spec.ts # OTelContext wiring tests
   config.json           # Default runtime configuration (empty object)
@@ -45,19 +46,24 @@ This project consumes two shared libraries from `devopsplaybook.io/_libs/`:
 
 ### Config Pattern
 
-`src/Config.ts` extends `ConfigBase` with `serviceId = "fluxcd-notifications"`. It has no project-specific fields beyond what `ConfigBase` provides (OTel collector endpoints, log level, API port, etc.). The `reload()` method delegates to `super.reload()` with a logger callback.
+`src/Config.ts` extends `ConfigBase` with `serviceId = "fluxcd-notifications"`. Project-specific fields are registered with `addConfigField` in the constructor:
+
+- `WEBHOOK_AUTHORIZATION_HEADER` — optional shared-secret check on `POST /` (sensitive, masked in logs)
+
+The constructor also overrides `VERSION` with the application's `package.json` version (`ConfigBase` otherwise reports the shared library's version, which breaks release identification in telemetry). The `reload()` method delegates to `super.reload()` with a logger callback.
 
 ### Request Flow
 
-1. FluxCD sends a POST to `/` with body `{ message, reason, metadata: { cluster } }`
-2. The adapter validates all three fields are present
-3. A structured log line is emitted: `<cluster>: <reason> - <message>`
-4. Returns `{ status: "ok" }` (200) or `{ error: "Bad Request" }` (400)
-5. A health check is available at `GET /api/status` → `{ started: true }`
+1. FluxCD sends a POST to `/` with the Kubernetes Event object (severity, message, reason, involvedObject, metadata, reportingController, timestamp)
+2. When `WEBHOOK_AUTHORIZATION_HEADER` is set, the request must carry the exact same `Authorization` header (401 otherwise)
+3. Payloads without a non-empty `message` and `reason` are rejected with 400, counted in `rejected_events_total{reason="invalid_payload"}` and logged as WARN with a short payload excerpt
+4. Accepted events are forwarded as one raw OTel log record via `StandardLogger.getLogger().emit()`: severity mapped from Flux severity (info→INFO, error→ERROR, warn/warning→WARN, else INFO), human-readable body `<cluster>: <reason> - <message>` (cluster defaults to `unknown` when `metadata.cluster` is missing), and `flux.*` attributes (cluster, reason, severity, object kind/name/namespace/apiVersion/uid, revision, reporting_controller) with the request OTel context attached
+5. Events are counted in `events_total{cluster, reason, severity}`; when no OTel logger is configured (no logs collector endpoint) the event is only printed to the console
+6. A health check is available at `GET /api/status` → `{ started: true, version: "<version>" }`
 
 ### Fastify Hooks
 
-`StandardTracerFastifyRegisterHooks` is registered with `ignoreList: ["GET-/api/status"]` to avoid tracing health checks.
+`StandardTracerFastifyRegisterHooks` is registered with `rootApiPath: "/"` so webhook requests to `POST /` are traced (the default `/api` root silently skips them), and `ignoreList: ["GET-/api/status"]` to avoid tracing health checks.
 
 ## Configuration
 
@@ -78,6 +84,10 @@ Key inherited configuration values from `ConfigBase`:
 - `OPENTELEMETRY_COLLECTOR_EXPORT_METRICS_INTERVAL_SECONDS` — metrics export interval
 - `OPENTELEMETRY_COLLECTOR_AWS` — enable AWS-specific OTel config (default: `false`)
 - `OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER` — auth header for OTel collector (sensitive, masked in logs)
+
+Project-specific configuration values:
+
+- `WEBHOOK_AUTHORIZATION_HEADER` — when set, `POST /` requires the exact same `Authorization` header (401 otherwise); empty by default (no auth)
 
 Special environment variable:
 
@@ -108,4 +118,4 @@ npm run lint     # oxlint check
 npm test         # Jest tests with coverage
 ```
 
-All three must pass. Coverage is currently at 100% for `Config.ts` and `OTelContext.ts`.
+All three must pass. Coverage is currently at 100% statements for `src/`.
