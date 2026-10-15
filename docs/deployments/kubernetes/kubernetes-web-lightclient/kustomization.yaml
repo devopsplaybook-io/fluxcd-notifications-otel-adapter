@@ -3,7 +3,6 @@ kind: Kustomization
 namespace: fluxcd-notifications-otel-adapter
 resources:
   - base/namespace.yaml
-  - base/pvc.yaml
   - base/deployment.yaml
   - base/service.yaml
   - base/rbac.yaml

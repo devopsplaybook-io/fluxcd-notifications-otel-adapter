@@ -1,0 +1,8 @@
+# https://hub.docker.com/r/devopsplaybookio/fluxcd-notifications-otel-adapter
+services:
+  fluxcd-notifications-otel-adapter:
+    image: devopsplaybookio/fluxcd-notifications-otel-adapter:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./config.json:/opt/app/config.json:ro
