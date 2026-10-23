@@ -4,7 +4,6 @@ const mockOTelTracer = jest.fn();
 const mockOTelSetMeter = jest.fn();
 const mockOTelMeter = jest.fn();
 const mockOTelLogger = jest.fn();
-const mockOTelRequestSpan = jest.fn();
 
 jest.mock("@devopsplaybook.io/common-utils", () => ({
   createOTelContext: jest.fn(() => ({
@@ -13,7 +12,6 @@ jest.mock("@devopsplaybook.io/common-utils", () => ({
     OTelSetMeter: mockOTelSetMeter,
     OTelMeter: mockOTelMeter,
     OTelLogger: mockOTelLogger,
-    OTelRequestSpan: mockOTelRequestSpan,
   })),
 }));
 
@@ -25,7 +23,6 @@ const {
   OTelSetMeter,
   OTelMeter,
   OTelLogger,
-  OTelRequestSpan,
 } = require("./OTelContext");
 
 describe("OTelContext", () => {
@@ -40,7 +37,6 @@ describe("OTelContext", () => {
     expect(OTelSetMeter).toBeDefined();
     expect(OTelMeter).toBeDefined();
     expect(OTelLogger).toBeDefined();
-    expect(OTelRequestSpan).toBeDefined();
   });
 
   describe("OTelSetTracer", () => {
@@ -82,17 +78,6 @@ describe("OTelContext", () => {
       expect(OTelLogger()).toBe(expected);
     });
   });
-
-  describe("OTelRequestSpan", () => {
-    it("should delegate to the context OTelRequestSpan", () => {
-      const req = { tracerSpanApi: { end: jest.fn() } };
-      mockOTelRequestSpan.mockReturnValueOnce(req.tracerSpanApi);
-      expect(OTelRequestSpan(req)).toBe(req.tracerSpanApi);
-    });
-
-    it("should return undefined when request has no span", () => {
-      mockOTelRequestSpan.mockReturnValueOnce(undefined);
-      expect(OTelRequestSpan({})).toBeUndefined();
-    });
-  });
 });
+
+export {};
