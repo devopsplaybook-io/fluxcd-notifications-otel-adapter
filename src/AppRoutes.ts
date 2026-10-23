@@ -1,10 +1,37 @@
 import { SeverityNumber } from "@opentelemetry/api-logs";
-import { OTelRequestContext } from "@devopsplaybook.io/otel-utils-fastify";
+import {
+  OTelRequestContext,
+  OTelRequestSpan,
+} from "@devopsplaybook.io/otel-utils-fastify";
 import type { FastifyInstance } from "fastify";
+import { inspect } from "node:util";
 import type { Config } from "./Config";
 import { OTelLogger, OTelMeter } from "./OTelContext";
 
 const FLUX_NOTIFICATIONS_MODULE = "fluxcd-notifications";
+
+export const MAX_MESSAGE_LENGTH = 16 * 1024;
+export const MAX_REASON_LENGTH = 256;
+export const MAX_CLUSTER_LENGTH = 256;
+
+const MAX_EXCERPT_LENGTH = 200;
+const MIN_TIMESTAMP_MS = Date.UTC(2000, 0, 1);
+const MAX_FUTURE_MS = 60 * 60 * 1000;
+
+// Known Flux controllers in priority order: when several of them contribute a
+// revision, the first one in this list wins instead of the first key returned
+// by Object.entries().
+const REVISION_KEY_PRIORITY = [
+  "kustomize.toolkit.fluxcd.io/revision",
+  "helm.toolkit.fluxcd.io/revision",
+  "source.toolkit.fluxcd.io/revision",
+  "notification.toolkit.fluxcd.io/revision",
+];
+
+const RFC3339_RE =
+  /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:\d{2})$/;
+
+type LogLevel = "info" | "warn" | "error";
 
 export interface FluxEventPayload {
   message?: string;
@@ -26,6 +53,7 @@ function mapSeverity(severity: string | undefined): {
   fluxSeverity: string;
   severityNumber: SeverityNumber;
   severityText: string;
+  logLevel: LogLevel;
 } {
   const normalized = severity?.trim().toLowerCase();
   switch (normalized) {
@@ -34,6 +62,7 @@ function mapSeverity(severity: string | undefined): {
         fluxSeverity: normalized,
         severityNumber: SeverityNumber.ERROR,
         severityText: "ERROR",
+        logLevel: "error",
       };
     case "warn":
     case "warning":
@@ -41,23 +70,48 @@ function mapSeverity(severity: string | undefined): {
         fluxSeverity: "warn",
         severityNumber: SeverityNumber.WARN,
         severityText: "WARN",
+        logLevel: "warn",
       };
     default:
       return {
         fluxSeverity: normalized || "unknown",
         severityNumber: SeverityNumber.INFO,
         severityText: "INFO",
+        logLevel: "info",
       };
   }
 }
 
+// Console (and ModuleLogger fallback) rendering only: strip ANSI escape
+// sequences and control characters so an event cannot forge log lines. The
+// OTel record body and flux.* attributes keep the raw values on purpose.
+function sanitizeForConsole(value: string): string {
+  return value
+    // eslint-disable-next-line no-control-regex
+    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "") // OSC sequences
+    // eslint-disable-next-line no-control-regex
+    .replace(/\u001b\[[0-9;:?]*[ -/]*[@-~]/g, "") // CSI sequences
+    // eslint-disable-next-line no-control-regex
+    .replace(/\u001b[@-_]/g, "") // other two-character escapes
+    // eslint-disable-next-line no-control-regex
+    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+}
+
 function payloadExcerpt(body: unknown): string {
-  const text = typeof body === "string" ? body : JSON.stringify(body);
-  return String(text ?? "undefined").slice(0, 200);
+  if (typeof body === "string") {
+    return body.slice(0, MAX_EXCERPT_LENGTH);
+  }
+  // Bound the inspection so a large payload is never fully stringified.
+  return inspect(body, {
+    depth: 1,
+    maxArrayLength: 10,
+    maxStringLength: MAX_EXCERPT_LENGTH,
+    breakLength: Infinity,
+  }).slice(0, MAX_EXCERPT_LENGTH);
 }
 
 function setIfPresent(
-  attributes: Record<string, string>,
+  attributes: Record<string, string | boolean>,
   key: string,
   value: unknown,
 ): void {
@@ -66,13 +120,43 @@ function setIfPresent(
   }
 }
 
-function findRevision(metadata: Record<string, unknown> | undefined): string | undefined {
+function findRevision(
+  metadata: Record<string, unknown> | undefined,
+): string | undefined {
+  const revisions = new Map<string, string>();
   for (const [key, value] of Object.entries(metadata ?? {})) {
     if (key.endsWith("/revision") && typeof value === "string" && value) {
+      revisions.set(key, value);
+    }
+  }
+  for (const key of REVISION_KEY_PRIORITY) {
+    const value = revisions.get(key);
+    if (value) {
       return value;
     }
   }
-  return undefined;
+  const [firstRemaining] = [...revisions.keys()].sort();
+  return firstRemaining ? revisions.get(firstRemaining) : undefined;
+}
+
+function truncate(value: string, maxLength: number): string {
+  return value.length > maxLength ? value.slice(0, maxLength) : value;
+}
+
+function resolveTimestamp(value: unknown): number {
+  const now = Date.now();
+  if (typeof value !== "string" || !RFC3339_RE.test(value)) {
+    return now;
+  }
+  const parsed = Date.parse(value);
+  if (
+    Number.isNaN(parsed) ||
+    parsed < MIN_TIMESTAMP_MS ||
+    parsed > now + MAX_FUTURE_MS
+  ) {
+    return now;
+  }
+  return parsed;
 }
 
 export function registerRoutes(fastify: FastifyInstance, config: Config): void {
@@ -96,14 +180,11 @@ export function registerRoutes(fastify: FastifyInstance, config: Config): void {
     }
 
     const event = request.body as FluxEventPayload | null | undefined;
-    if (
-      !event ||
-      typeof event !== "object" ||
-      typeof event.message !== "string" ||
-      !event.message ||
-      typeof event.reason !== "string" ||
-      !event.reason
-    ) {
+    const message =
+      event && typeof event === "object" && typeof event.message === "string"
+        ? event.message.trim()
+        : "";
+    if (!event || typeof event !== "object" || !message) {
       rejectedEventsTotal.add(1, { reason: "invalid_payload" });
       logger.warn(
         `Rejected malformed Flux notification payload: ${payloadExcerpt(request.body)}`,
@@ -112,20 +193,28 @@ export function registerRoutes(fastify: FastifyInstance, config: Config): void {
       return;
     }
 
-    const cluster =
-      typeof event.metadata?.cluster === "string" && event.metadata.cluster
-        ? event.metadata.cluster
-        : "unknown";
-    const { fluxSeverity, severityNumber, severityText } = mapSeverity(
-      event.severity,
-    );
-    const bodyText = `${cluster}: ${event.reason} - ${event.message}`;
+    const rawReason =
+      typeof event.reason === "string" ? event.reason.trim() : "";
+    const reason = truncate(rawReason || "unknown", MAX_REASON_LENGTH);
+    const rawCluster =
+      typeof event.metadata?.cluster === "string"
+        ? event.metadata.cluster.trim()
+        : "";
+    const cluster = truncate(rawCluster || "unknown", MAX_CLUSTER_LENGTH);
+    const messageTruncated = message.length > MAX_MESSAGE_LENGTH;
+    const emittedMessage = truncate(message, MAX_MESSAGE_LENGTH);
+    const { fluxSeverity, severityNumber, severityText, logLevel } =
+      mapSeverity(event.severity);
+    const bodyText = `${cluster}: ${reason} - ${emittedMessage}`;
 
-    const attributes: Record<string, string> = {
+    const attributes: Record<string, string | boolean> = {
       "flux.cluster": cluster,
-      "flux.reason": event.reason,
+      "flux.reason": reason,
       "flux.severity": fluxSeverity,
     };
+    if (messageTruncated) {
+      attributes["flux.message.truncated"] = true;
+    }
     const involvedObject = event.involvedObject;
     if (involvedObject && typeof involvedObject === "object") {
       setIfPresent(attributes, "flux.object.kind", involvedObject.kind);
@@ -145,25 +234,40 @@ export function registerRoutes(fastify: FastifyInstance, config: Config): void {
     );
 
     if (otelLogger) {
-      const timestamp = Date.parse(event.timestamp ?? "");
+      // otel-light correlates logs from the trace.id/span.id attributes only,
+      // not from the OTLP traceId/spanId fields of the record.
+      const spanContext = OTelRequestSpan(request)?.spanContext();
+      if (spanContext?.traceId && spanContext?.spanId) {
+        attributes["trace.id"] = spanContext.traceId;
+        attributes["span.id"] = spanContext.spanId;
+      }
       otelLogger.emit({
         severityNumber,
         severityText,
         body: bodyText,
         attributes,
         context: OTelRequestContext(request),
-        ...(Number.isNaN(timestamp) ? {} : { timestamp }),
+        timestamp: resolveTimestamp(event.timestamp),
       });
-      console.log(`[info] [${FLUX_NOTIFICATIONS_MODULE}] ${bodyText}`);
+      console.log(
+        `[${logLevel}] [${FLUX_NOTIFICATIONS_MODULE}] ${sanitizeForConsole(bodyText)}`,
+      );
     } else {
       // No OTel logger configured (collector endpoint unset): ModuleLogger
       // still prints the record to the console for pod logs.
-      logger.info(bodyText);
+      const fallbackBody = sanitizeForConsole(bodyText);
+      if (logLevel === "error") {
+        logger.error(fallbackBody);
+      } else if (logLevel === "warn") {
+        logger.warn(fallbackBody);
+      } else {
+        logger.info(fallbackBody);
+      }
     }
 
     eventsTotal.add(1, {
       cluster,
-      reason: event.reason,
+      reason,
       severity: fluxSeverity,
     });
     reply.status(200).send({ status: "ok" });

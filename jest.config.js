@@ -24,4 +24,13 @@ module.exports = {
   coverageProvider: "v8",
   testMatch: ["/**/src/**/*.spec.(ts|js)"],
   testEnvironment: "node",
+  collectCoverageFrom: ["src/**/*.ts", "!src/**/*.spec.ts"],
+  coverageThreshold: {
+    global: {
+      statements: 85,
+      branches: 80,
+      functions: 85,
+      lines: 85,
+    },
+  },
 };
