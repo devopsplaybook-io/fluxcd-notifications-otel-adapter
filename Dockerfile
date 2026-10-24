@@ -1,24 +1,29 @@
 # BUILD
-FROM node:26-alpine as builder
+FROM node:26-alpine AS builder
 
 WORKDIR /opt/src
 
 RUN apk add --no-cache bash git python3 perl alpine-sdk
 
-COPY . .
+COPY package.json package-lock.json ./
+RUN npm ci
 
-RUN npm ci && \
-    npm run build
+COPY . .
+RUN npm run build && npm prune --omit=dev
 
 
 # RUN
 FROM node:26-alpine
 
-COPY --from=builder /opt/src/node_modules /opt/app/node_modules
-COPY --from=builder /opt/src/dist /opt/app/dist
-COPY config.json /opt/app/config.json
-COPY package.json /opt/app/package.json
+ENV NODE_ENV=production
 
 WORKDIR /opt/app
 
-CMD ["dist/App.js"]
+COPY --from=builder /opt/src/node_modules ./node_modules
+COPY --from=builder /opt/src/dist ./dist
+COPY --from=builder /opt/src/config.json ./config.json
+COPY --from=builder /opt/src/package.json ./package.json
+
+USER node
+
+CMD ["node", "dist/App.js"]

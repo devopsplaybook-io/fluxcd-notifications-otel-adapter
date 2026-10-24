@@ -10,11 +10,16 @@ concurrency:
   group: pr-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   pr-verify:
-    uses: devopsplaybook-io/common-utils/.github/workflows/reusable-pr-verify.yml@main
+    uses: devopsplaybook-io/common-utils/.github/workflows/reusable-pr-verify.yml@f132584acb5d712c571012e7dfbbeba6a92efe93
     with:
       node_app_directories: '["."]'
+      node_version: "26"
+      audit_enabled: true
     secrets:
       DOCKER_HUB_USERNAME: ${{ secrets.DOCKER_HUB_USERNAME }}
       DOCKER_HUB_ACCESS_TOKEN: ${{ secrets.DOCKER_HUB_ACCESS_TOKEN }}

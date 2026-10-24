@@ -6,7 +6,7 @@ metadata:
     app: fluxcd-notifications-otel-adapter
 spec:
   replicas: 1
-  revisionHistoryLimit: 1
+  revisionHistoryLimit: 3
   selector:
     matchLabels:
       app: fluxcd-notifications-otel-adapter
@@ -16,9 +16,24 @@ spec:
         app: fluxcd-notifications-otel-adapter
     spec:
       serviceAccountName: fluxcd-notifications-otel-adapter
+      automountServiceAccountToken: false
+      terminationGracePeriodSeconds: 45
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - image: fluxcd-notifications-otel-adapter
           name: fluxcd-notifications-otel-adapter
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
           resources:
             limits:
               memory: 500Mi
@@ -30,7 +45,23 @@ spec:
             - name: config-volume
               mountPath: /opt/app/config.json
               subPath: config.json
+            - name: tmp-volume
+              mountPath: /tmp
           imagePullPolicy: Always
+          startupProbe:
+            httpGet:
+              path: /api/status
+              port: 8080
+            periodSeconds: 5
+            failureThreshold: 30
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /api/status
+              port: 8080
+            periodSeconds: 15
+            failureThreshold: 3
+            timeoutSeconds: 3
           readinessProbe:
             httpGet:
               path: /api/status
@@ -38,7 +69,11 @@ spec:
             initialDelaySeconds: 5
             periodSeconds: 10
             failureThreshold: 3
+            timeoutSeconds: 3
       volumes:
         - name: config-volume
           configMap:
             name: fluxcd-notifications-otel-adapter-config
+        - name: tmp-volume
+          emptyDir:
+            sizeLimit: 16Mi

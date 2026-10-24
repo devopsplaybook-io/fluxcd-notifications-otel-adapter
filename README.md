@@ -141,7 +141,7 @@ spec:
     spec:
       serviceAccountName: fluxcd-notifications-otel-adapter
       containers:
-        - image: devopsplaybookio/fluxcd-notifications-otel-adapter:latest
+        - image: devopsplaybookio/fluxcd-notifications-otel-adapter:0.8.0
           name: fluxcd-notifications-otel-adapter
           resources:
             limits:

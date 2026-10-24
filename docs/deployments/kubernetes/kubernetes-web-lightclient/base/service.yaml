@@ -3,7 +3,7 @@ kind: Service
 metadata:
   name: fluxcd-notifications-otel-adapter
 spec:
-  type: NodePort
+  type: ClusterIP
   ports:
     - name: tcp
       port: 8080

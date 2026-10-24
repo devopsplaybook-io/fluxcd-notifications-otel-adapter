@@ -9,5 +9,5 @@ resources:
   - base/configmap.yaml
 images:
   - name: fluxcd-notifications-otel-adapter
-    newTag: latest
+    newTag: "0.8.0"
     newName: devopsplaybookio/fluxcd-notifications-otel-adapter
