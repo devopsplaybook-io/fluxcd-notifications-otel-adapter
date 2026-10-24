@@ -11,3 +11,5 @@ docker compose up -d
 ```
 
 The webhook is then available at `http://localhost:8080/`.
+
+`config.json` is read once at startup: restart the container (`docker compose restart`) after editing it.
