@@ -3,20 +3,40 @@ import {
   OTelRequestContext,
   OTelRequestSpan,
 } from "@devopsplaybook.io/otel-utils-fastify";
-import type { FastifyInstance } from "fastify";
+import type {
+  FastifyError,
+  FastifyInstance,
+  FastifyReply,
+  FastifyRequest,
+} from "fastify";
+import { timingSafeEqual } from "node:crypto";
 import { inspect } from "node:util";
 import type { Config } from "./Config";
 import { OTelLogger, OTelMeter } from "./OTelContext";
+import { RateLimiter, resolveRateLimitPerMinute } from "./RateLimiter";
 
 const FLUX_NOTIFICATIONS_MODULE = "fluxcd-notifications";
 
 export const MAX_MESSAGE_LENGTH = 16 * 1024;
 export const MAX_REASON_LENGTH = 256;
 export const MAX_CLUSTER_LENGTH = 256;
+export const MAX_METRIC_ATTRIBUTE_LENGTH = 64;
 
 const MAX_EXCERPT_LENGTH = 200;
+const MAX_ROUTE_LENGTH = 120;
 const MIN_TIMESTAMP_MS = Date.UTC(2000, 0, 1);
 const MAX_FUTURE_MS = 60 * 60 * 1000;
+
+export type RejectionReason =
+  | "invalid_json"
+  | "payload_too_large"
+  | "unsupported_media_type"
+  | "bad_request"
+  | "unauthorized"
+  | "rate_limited"
+  | "invalid_payload";
+
+export type MetricSeverity = "info" | "warn" | "error" | "unknown";
 
 // Known Flux controllers in priority order: when several of them contribute a
 // revision, the first one in this list wins instead of the first key returned
@@ -51,6 +71,7 @@ export interface FluxEventPayload {
 
 function mapSeverity(severity: string | undefined): {
   fluxSeverity: string;
+  metricSeverity: MetricSeverity;
   severityNumber: SeverityNumber;
   severityText: string;
   logLevel: LogLevel;
@@ -60,6 +81,7 @@ function mapSeverity(severity: string | undefined): {
     case "error":
       return {
         fluxSeverity: normalized,
+        metricSeverity: "error",
         severityNumber: SeverityNumber.ERROR,
         severityText: "ERROR",
         logLevel: "error",
@@ -68,6 +90,7 @@ function mapSeverity(severity: string | undefined): {
     case "warning":
       return {
         fluxSeverity: "warn",
+        metricSeverity: "warn",
         severityNumber: SeverityNumber.WARN,
         severityText: "WARN",
         logLevel: "warn",
@@ -75,6 +98,7 @@ function mapSeverity(severity: string | undefined): {
     default:
       return {
         fluxSeverity: normalized || "unknown",
+        metricSeverity: normalized === "info" ? "info" : "unknown",
         severityNumber: SeverityNumber.INFO,
         severityText: "INFO",
         logLevel: "info",
@@ -159,22 +183,136 @@ function resolveTimestamp(value: unknown): number {
   return parsed;
 }
 
+// Metric labels are normalized to a bounded, low-cardinality set; the raw
+// values stay in the log record and body.
+export function normalizeMetricReason(raw: string): string {
+  const normalized = raw
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9_.:-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, MAX_METRIC_ATTRIBUTE_LENGTH);
+  return normalized || "unknown";
+}
+
+export function normalizeMetricCluster(raw: string): string {
+  const normalized = raw
+    .trim()
+    .replace(/[^A-Za-z0-9_.:-]+/g, "_")
+    .replace(/^_+|_+$/g, "")
+    .slice(0, MAX_METRIC_ATTRIBUTE_LENGTH);
+  return normalized || "unknown";
+}
+
+export function isAuthorized(provided: unknown, expected: string): boolean {
+  if (typeof provided !== "string" || !expected) {
+    return false;
+  }
+  const providedBuffer = Buffer.from(provided, "utf8");
+  const expectedBuffer = Buffer.from(expected, "utf8");
+  if (providedBuffer.length !== expectedBuffer.length) {
+    return false;
+  }
+  return timingSafeEqual(providedBuffer, expectedBuffer);
+}
+
+function mapErrorRejectionReason(
+  error: FastifyError,
+  statusCode: number,
+): RejectionReason {
+  if (statusCode === 413) {
+    return "payload_too_large";
+  }
+  if (statusCode === 415) {
+    return "unsupported_media_type";
+  }
+  if (
+    statusCode === 400 &&
+    error.code === "FST_ERR_CTP_INVALID_JSON_BODY"
+  ) {
+    return "invalid_json";
+  }
+  return "bad_request";
+}
+
+function sendError(
+  reply: FastifyReply,
+  error: FastifyError,
+  statusCode: number,
+): void {
+  const { headers } = error as FastifyError & {
+    headers?: Record<string, string>;
+  };
+  if (headers) {
+    reply.headers(headers);
+  }
+  reply.status(statusCode).send(error);
+}
+
 export function registerRoutes(fastify: FastifyInstance, config: Config): void {
   const logger = OTelLogger().createModuleLogger(FLUX_NOTIFICATIONS_MODULE);
   const otelLogger = OTelLogger().getLogger();
   const eventsTotal = OTelMeter().createCounter("events_total");
   const rejectedEventsTotal = OTelMeter().createCounter("rejected_events_total");
 
+  // Tracks requests already accounted for by the handler or a dedicated hook,
+  // so the error handler never counts the same rejection twice.
+  const rejectedRequests = new WeakSet<object>();
+
+  const requestRoute = (request: FastifyRequest): string =>
+    `${request.method} ${truncate(sanitizeForConsole(request.url), MAX_ROUTE_LENGTH)}`;
+
+  const recordRejection = (
+    request: FastifyRequest,
+    status: number,
+    reason: RejectionReason,
+    detail?: string,
+  ): void => {
+    rejectedRequests.add(request);
+    rejectedEventsTotal.add(1, { reason });
+    const message = `Webhook request rejected: route=${requestRoute(request)} status=${status} reason=${reason}`;
+    logger.warn(detail ? `${message} ${detail}` : message);
+  };
+
+  const rateLimiter = new RateLimiter({
+    limitPerMinute: resolveRateLimitPerMinute(
+      config.WEBHOOK_RATE_LIMIT_PER_MINUTE,
+    ),
+  });
+
+  // onRequest runs before body parsing, so an over-limit body is never read.
+  const rateLimitHook = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<void> => {
+    const decision = rateLimiter.allow(request.ip);
+    if (decision.allowed) {
+      return;
+    }
+    recordRejection(
+      request,
+      429,
+      "rate_limited",
+      `retry_after=${decision.retryAfterSeconds}s`,
+    );
+    reply.header("Retry-After", String(decision.retryAfterSeconds));
+    await reply.status(429).send({ error: "Too Many Requests" });
+  };
+
   fastify.get("/api/status", async () => {
     return { started: true, version: config.VERSION };
   });
 
-  fastify.post("/", async (request, reply) => {
+  fastify.post("/", { onRequest: rateLimitHook }, async (request, reply) => {
     if (
       config.WEBHOOK_AUTHORIZATION_HEADER &&
-      request.headers.authorization !== config.WEBHOOK_AUTHORIZATION_HEADER
+      !isAuthorized(
+        request.headers.authorization,
+        config.WEBHOOK_AUTHORIZATION_HEADER,
+      )
     ) {
-      rejectedEventsTotal.add(1, { reason: "unauthorized" });
+      recordRejection(request, 401, "unauthorized");
+      reply.header("WWW-Authenticate", "Bearer");
       reply.status(401).send({ error: "Unauthorized" });
       return;
     }
@@ -185,9 +323,11 @@ export function registerRoutes(fastify: FastifyInstance, config: Config): void {
         ? event.message.trim()
         : "";
     if (!event || typeof event !== "object" || !message) {
-      rejectedEventsTotal.add(1, { reason: "invalid_payload" });
-      logger.warn(
-        `Rejected malformed Flux notification payload: ${payloadExcerpt(request.body)}`,
+      recordRejection(
+        request,
+        400,
+        "invalid_payload",
+        `excerpt=${truncate(sanitizeForConsole(payloadExcerpt(request.body)), MAX_EXCERPT_LENGTH)}`,
       );
       reply.status(400).send({ error: "Bad Request" });
       return;
@@ -203,7 +343,7 @@ export function registerRoutes(fastify: FastifyInstance, config: Config): void {
     const cluster = truncate(rawCluster || "unknown", MAX_CLUSTER_LENGTH);
     const messageTruncated = message.length > MAX_MESSAGE_LENGTH;
     const emittedMessage = truncate(message, MAX_MESSAGE_LENGTH);
-    const { fluxSeverity, severityNumber, severityText, logLevel } =
+    const { fluxSeverity, metricSeverity, severityNumber, severityText, logLevel } =
       mapSeverity(event.severity);
     const bodyText = `${cluster}: ${reason} - ${emittedMessage}`;
 
@@ -266,10 +406,41 @@ export function registerRoutes(fastify: FastifyInstance, config: Config): void {
     }
 
     eventsTotal.add(1, {
-      cluster,
-      reason,
-      severity: fluxSeverity,
+      cluster: normalizeMetricCluster(cluster),
+      reason: normalizeMetricReason(reason),
+      severity: metricSeverity,
     });
     reply.status(200).send({ status: "ok" });
+  });
+
+  fastify.setErrorHandler<FastifyError>((error, request, reply) => {
+    const statusCode = error.statusCode ?? 500;
+    if (rejectedRequests.has(request)) {
+      sendError(reply, error, statusCode);
+      return;
+    }
+    if (statusCode >= 500) {
+      logger.error(
+        `Webhook request failed: route=${requestRoute(request)} status=${statusCode} message=${truncate(sanitizeForConsole(error.message), MAX_EXCERPT_LENGTH)}`,
+      );
+      sendError(reply, error, statusCode);
+      return;
+    }
+    recordRejection(
+      request,
+      statusCode,
+      mapErrorRejectionReason(error, statusCode),
+      `message=${truncate(sanitizeForConsole(error.message), MAX_EXCERPT_LENGTH)}`,
+    );
+    sendError(reply, error, statusCode);
+  });
+
+  fastify.setNotFoundHandler((request, reply) => {
+    recordRejection(request, 404, "bad_request");
+    reply.status(404).send({
+      message: `Route ${request.method}:${request.url} not found`,
+      error: "Not Found",
+      statusCode: 404,
+    });
   });
 }

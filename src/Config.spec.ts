@@ -79,11 +79,23 @@ describe("Config", () => {
       expect(config.WEBHOOK_AUTHORIZATION_HEADER).toBe("");
     });
 
+    it("should default WEBHOOK_RATE_LIMIT_PER_MINUTE to 600", () => {
+      const config = new Config();
+      expect(config.WEBHOOK_RATE_LIMIT_PER_MINUTE).toBe(600);
+    });
+
     it("should register WEBHOOK_AUTHORIZATION_HEADER as a sensitive config field", () => {
       new Config();
       expect(capturedConfigFields).toContainEqual({
         field: "WEBHOOK_AUTHORIZATION_HEADER",
         sensitive: true,
+      });
+    });
+
+    it("should register WEBHOOK_RATE_LIMIT_PER_MINUTE as a non-sensitive config field", () => {
+      new Config();
+      expect(capturedConfigFields).toContainEqual({
+        field: "WEBHOOK_RATE_LIMIT_PER_MINUTE",
       });
     });
 
