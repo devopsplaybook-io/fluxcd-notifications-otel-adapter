@@ -1,8 +1,12 @@
 import { StandardMeter, StandardTracer } from "@devopsplaybook.io/otel-utils";
 import { StandardTracerFastifyRegisterHooks } from "@devopsplaybook.io/otel-utils-fastify";
-import Fastify, { type FastifyInstance } from "fastify";
+import Fastify, {
+  type FastifyInstance,
+  type FastifyServerOptions,
+} from "fastify";
 import { Config } from "./Config";
 import { registerRoutes } from "./AppRoutes";
+import { resolveRateLimitPerMinute } from "./RateLimiter";
 import {
   OTelLogger,
   OTelMeter,
@@ -17,6 +21,15 @@ export interface AppOptions {
 }
 
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
+
+// A full 2 048-record log batch is bounded to tens of MiB with a 64 KiB body
+// limit and the 16 KiB message cap; raise it only with a documented reason.
+export const FASTIFY_OPTIONS: FastifyServerOptions = {
+  bodyLimit: 64 * 1024,
+  connectionTimeout: 10_000,
+  requestTimeout: 15_000,
+  keepAliveTimeout: 72_000,
+};
 
 const logger = OTelLogger().createModuleLogger("app");
 
@@ -118,7 +131,27 @@ export async function start(options?: AppOptions): Promise<FastifyInstance> {
 
   logger.info("====== Starting fluxcd-notifications-otel-adapter Server ======");
 
-  const fastify = Fastify({});
+  // Fail-open is kept for backward compatibility (the live deployment has no
+  // auth header configured): make the disabled authentication visible.
+  if (!config.WEBHOOK_AUTHORIZATION_HEADER) {
+    logger.warn(
+      "webhook authentication disabled: WEBHOOK_AUTHORIZATION_HEADER is not set",
+    );
+  }
+  const rateLimitPerMinute = resolveRateLimitPerMinute(
+    config.WEBHOOK_RATE_LIMIT_PER_MINUTE,
+  );
+  if (rateLimitPerMinute === 0) {
+    logger.info(
+      "webhook rate limiting disabled (WEBHOOK_RATE_LIMIT_PER_MINUTE=0)",
+    );
+  } else {
+    logger.info(
+      `webhook rate limit: ${rateLimitPerMinute} requests/minute per client IP`,
+    );
+  }
+
+  const fastify = Fastify(FASTIFY_OPTIONS);
 
   // rootApiPath "/" is required so webhook requests to POST / are traced:
   // the hooks default to "/api" and silently skip everything outside it.

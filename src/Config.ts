@@ -8,6 +8,8 @@ const { version: APP_VERSION } = require("../package.json");
 
 export class Config extends ConfigBase {
   public WEBHOOK_AUTHORIZATION_HEADER = "";
+  // Per-client-IP fixed window; 0 disables the in-process limiter.
+  public WEBHOOK_RATE_LIMIT_PER_MINUTE = 600;
 
   constructor() {
     super("fluxcd-notifications");
@@ -15,6 +17,7 @@ export class Config extends ConfigBase {
       field: "WEBHOOK_AUTHORIZATION_HEADER",
       sensitive: true,
     });
+    this.addConfigField({ field: "WEBHOOK_RATE_LIMIT_PER_MINUTE" });
     // ConfigBase defaults VERSION to the shared library's version; telemetry
     // must report this application's version instead.
     this.VERSION = APP_VERSION;

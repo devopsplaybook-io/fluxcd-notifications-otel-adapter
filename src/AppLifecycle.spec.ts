@@ -50,7 +50,9 @@ jest.mock("./AppRoutes", () => ({
 const mockConfigReload = jest.fn();
 const mockConfig = {
   API_PORT: 8080,
-  VERSION: "0.6.0",
+  VERSION: "0.7.0",
+  WEBHOOK_AUTHORIZATION_HEADER: "",
+  WEBHOOK_RATE_LIMIT_PER_MINUTE: 600,
   reload: mockConfigReload,
 };
 
@@ -88,6 +90,8 @@ beforeEach(() => {
   mockLoggerShutdown.mockReset().mockResolvedValue(undefined);
   mockTracerShutdown.mockReset().mockResolvedValue(undefined);
   mockMeterShutdown.mockReset().mockResolvedValue(undefined);
+  mockConfig.WEBHOOK_AUTHORIZATION_HEADER = "";
+  mockConfig.WEBHOOK_RATE_LIMIT_PER_MINUTE = 600;
   jest.resetModules();
 
   initialSigtermListeners = process.listeners("SIGTERM");

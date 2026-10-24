@@ -28,9 +28,12 @@ jest.mock("@devopsplaybook.io/otel-utils-fastify", () => ({
   OTelRequestSpan: mockRequestSpan,
 }));
 
+jest.mock("./Config", () => ({ Config: jest.fn() }));
+
 // swc hoists static imports above the mock declarations, so load the module
 // under test with an in-place require after jest.mock registration.
 const { registerRoutes } = require("./AppRoutes");
+const { FASTIFY_OPTIONS } = require("./App");
 
 import Fastify from "fastify";
 import { SeverityNumber } from "@opentelemetry/api-logs";
@@ -41,6 +44,7 @@ function buildConfig(overrides: Partial<Config> = {}): Config {
   return {
     VERSION: "1.2.3",
     WEBHOOK_AUTHORIZATION_HEADER: "",
+    WEBHOOK_RATE_LIMIT_PER_MINUTE: 600,
     ...overrides,
   } as unknown as Config;
 }
@@ -74,7 +78,7 @@ describe("App API routes", () => {
     jest.clearAllMocks();
     jest.spyOn(console, "log").mockImplementation(() => {});
     config = buildConfig();
-    fastify = Fastify({ logger: false });
+    fastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
     registerRoutes(fastify, config);
   });
 
@@ -137,7 +141,7 @@ describe("App API routes", () => {
 
       expect(mockEventsCounter.add).toHaveBeenCalledWith(1, {
         cluster: "production-us-east-1",
-        reason: "ReconciliationSucceeded",
+        reason: "reconciliationsucceeded",
         severity: "info",
       });
       expect(mockRejectedEventsCounter.add).not.toHaveBeenCalled();
@@ -153,7 +157,7 @@ describe("App API routes", () => {
 
     it("should fall back to module logger only when no OTel logger is available", async () => {
       mockGetLogger.mockReturnValueOnce(undefined);
-      const fallbackFastify = Fastify({ logger: false });
+      const fallbackFastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
       registerRoutes(fallbackFastify, config);
 
       await fallbackFastify.inject({
@@ -184,7 +188,7 @@ describe("App API routes", () => {
       mockGetLogger.mockReturnValueOnce(undefined);
       const payload = fullFluxPayload();
       payload.severity = "error";
-      const fallbackFastify = Fastify({ logger: false });
+      const fallbackFastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
       registerRoutes(fallbackFastify, config);
 
       await fallbackFastify.inject({
@@ -215,7 +219,7 @@ describe("App API routes", () => {
       mockGetLogger.mockReturnValueOnce(undefined);
       const payload = fullFluxPayload();
       payload.severity = "warning";
-      const fallbackFastify = Fastify({ logger: false });
+      const fallbackFastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
       registerRoutes(fallbackFastify, config);
 
       await fallbackFastify.inject({
@@ -253,7 +257,7 @@ describe("App API routes", () => {
 
     it("should sanitize the fallback logger rendering as well", async () => {
       mockGetLogger.mockReturnValueOnce(undefined);
-      const fallbackFastify = Fastify({ logger: false });
+      const fallbackFastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
       registerRoutes(fallbackFastify, config);
 
       await fallbackFastify.inject({
@@ -352,8 +356,11 @@ describe("App API routes", () => {
       expect(response.statusCode).toBe(400);
       expect(response.json()).toEqual({ error: "Bad Request" });
       expect(mockModuleLogger.warn).toHaveBeenCalledWith(
-        expect.stringContaining("Rejected malformed Flux notification payload"),
+        expect.stringContaining(
+          "Webhook request rejected: route=POST / status=400 reason=invalid_payload",
+        ),
       );
+      expect(mockRejectedEventsCounter.add).toHaveBeenCalledTimes(1);
       expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
         reason: "invalid_payload",
       });
@@ -414,8 +421,10 @@ describe("App API routes", () => {
 
       expect(response.statusCode).toBe(400);
       const warning = mockModuleLogger.warn.mock.calls[0][0] as string;
-      expect(warning.length).toBeLessThan(300);
-      expect(warning).toContain("Rejected malformed Flux notification payload");
+      expect(warning.length).toBeLessThan(400);
+      expect(warning).toContain(
+        "Webhook request rejected: route=POST / status=400 reason=invalid_payload",
+      );
     });
 
     it("should truncate a message longer than 16 KiB and flag it", async () => {
@@ -461,8 +470,8 @@ describe("App API routes", () => {
         `${truncatedCluster}: ${truncatedReason} - Deployment applied`,
       );
       expect(mockEventsCounter.add).toHaveBeenCalledWith(1, {
-        cluster: truncatedCluster,
-        reason: truncatedReason,
+        cluster: "c".repeat(64),
+        reason: "r".repeat(64),
         severity: "unknown",
       });
     });
@@ -607,7 +616,7 @@ describe("App API routes", () => {
     describe("with WEBHOOK_AUTHORIZATION_HEADER configured", () => {
       beforeEach(() => {
         config = buildConfig({ WEBHOOK_AUTHORIZATION_HEADER: "Bearer s3cr3t" });
-        fastify = Fastify({ logger: false });
+        fastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
         registerRoutes(fastify, config);
       });
 
@@ -632,12 +641,29 @@ describe("App API routes", () => {
         });
 
         expect(response.statusCode).toBe(401);
+        expect(response.headers["www-authenticate"]).toBe("Bearer");
         expect(response.json()).toEqual({ error: "Unauthorized" });
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledTimes(1);
         expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
           reason: "unauthorized",
         });
         expect(mockRawEmit).not.toHaveBeenCalled();
         expect(mockEventsCounter.add).not.toHaveBeenCalled();
+      });
+
+      it("should reject an equal-length wrong Authorization header with 401", async () => {
+        const response = await fastify.inject({
+          method: "POST",
+          url: "/",
+          headers: { authorization: "Bearer s3cr3X" },
+          payload: fullFluxPayload(),
+        });
+
+        expect(response.statusCode).toBe(401);
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledTimes(1);
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
+          reason: "unauthorized",
+        });
       });
 
       it("should reject a request without an Authorization header with 401", async () => {
@@ -648,9 +674,194 @@ describe("App API routes", () => {
         });
 
         expect(response.statusCode).toBe(401);
+        expect(response.headers["www-authenticate"]).toBe("Bearer");
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledTimes(1);
         expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
           reason: "unauthorized",
         });
+      });
+    });
+
+    describe("parser-level rejections", () => {
+      it("should count invalid JSON once and log without the raw body", async () => {
+        const response = await fastify.inject({
+          method: "POST",
+          url: "/",
+          headers: { "content-type": "application/json" },
+          payload: '{"message": "secret-body-text"',
+        });
+
+        expect(response.statusCode).toBe(400);
+        expect(response.json().code).toBe("FST_ERR_CTP_INVALID_JSON_BODY");
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledTimes(1);
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
+          reason: "invalid_json",
+        });
+        expect(mockModuleLogger.warn).toHaveBeenCalledTimes(1);
+        const warning = mockModuleLogger.warn.mock.calls[0][0] as string;
+        expect(warning).toContain("route=POST /");
+        expect(warning).toContain("status=400");
+        expect(warning).toContain("reason=invalid_json");
+        expect(warning).not.toContain("secret-body-text");
+      });
+
+      it("should count a body over 64 KiB once as payload_too_large", async () => {
+        const response = await fastify.inject({
+          method: "POST",
+          url: "/",
+          headers: { "content-type": "text/plain" },
+          payload: "x".repeat(64 * 1024 + 1),
+        });
+
+        expect(response.statusCode).toBe(413);
+        expect(response.json().code).toBe("FST_ERR_CTP_BODY_TOO_LARGE");
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledTimes(1);
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
+          reason: "payload_too_large",
+        });
+        expect(mockModuleLogger.warn).toHaveBeenCalledTimes(1);
+      });
+
+      it("should count an unsupported content type once", async () => {
+        const response = await fastify.inject({
+          method: "POST",
+          url: "/",
+          headers: { "content-type": "application/xml" },
+          payload: "<event/>",
+        });
+
+        expect(response.statusCode).toBe(415);
+        expect(response.json().code).toBe("FST_ERR_CTP_INVALID_MEDIA_TYPE");
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledTimes(1);
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
+          reason: "unsupported_media_type",
+        });
+      });
+
+      it("should count an unknown route once and preserve the default 404 body", async () => {
+        const response = await fastify.inject({ method: "GET", url: "/nope" });
+
+        expect(response.statusCode).toBe(404);
+        expect(response.json()).toEqual({
+          message: "Route GET:/nope not found",
+          error: "Not Found",
+          statusCode: 404,
+        });
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledTimes(1);
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
+          reason: "bad_request",
+        });
+        expect(mockModuleLogger.warn).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe("rate limiting", () => {
+      it("should return 429 beyond the configured rate and count once per rejection", async () => {
+        config = buildConfig({ WEBHOOK_RATE_LIMIT_PER_MINUTE: 2 });
+        fastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
+        registerRoutes(fastify, config);
+
+        const first = await postEvent(fullFluxPayload());
+        const second = await postEvent(fullFluxPayload());
+        const third = await postEvent(fullFluxPayload());
+        const fourth = await postEvent(fullFluxPayload());
+
+        expect(first.statusCode).toBe(200);
+        expect(second.statusCode).toBe(200);
+        expect(third.statusCode).toBe(429);
+        expect(third.json()).toEqual({ error: "Too Many Requests" });
+        expect(Number(third.headers["retry-after"])).toBeGreaterThan(0);
+        expect(fourth.statusCode).toBe(429);
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledTimes(2);
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
+          reason: "rate_limited",
+        });
+        expect(mockEventsCounter.add).toHaveBeenCalledTimes(2);
+      });
+
+      it("should disable rate limiting when configured with 0", async () => {
+        config = buildConfig({ WEBHOOK_RATE_LIMIT_PER_MINUTE: 0 });
+        fastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
+        registerRoutes(fastify, config);
+
+        for (let i = 0; i < 5; i++) {
+          const response = await postEvent(fullFluxPayload());
+          expect(response.statusCode).toBe(200);
+        }
+        expect(mockEventsCounter.add).toHaveBeenCalledTimes(5);
+        expect(mockRejectedEventsCounter.add).not.toHaveBeenCalled();
+      });
+    });
+
+    describe("failure accounting", () => {
+      it("should not count a 500 as a rejected event", async () => {
+        fastify.get("/boom", async () => {
+          throw new Error("boom");
+        });
+
+        const response = await fastify.inject({ method: "GET", url: "/boom" });
+
+        expect(response.statusCode).toBe(500);
+        expect(mockRejectedEventsCounter.add).not.toHaveBeenCalled();
+        expect(mockModuleLogger.error).toHaveBeenCalledTimes(1);
+      });
+    });
+
+    describe("bounded metric attributes", () => {
+      it("should normalize an unusual reason for metrics but keep the raw log value", async () => {
+        await postEvent({
+          message: "ok",
+          reason: "  Reconciled/OK (v2)!! ",
+          metadata: { cluster: "Prod Cluster/EU" },
+        });
+
+        const record = mockRawEmit.mock.calls[0][0];
+        expect(record.attributes["flux.reason"]).toBe("Reconciled/OK (v2)!!");
+        expect(record.attributes["flux.cluster"]).toBe("Prod Cluster/EU");
+        expect(mockEventsCounter.add).toHaveBeenCalledWith(1, {
+          cluster: "Prod_Cluster_EU",
+          reason: "reconciled_ok_v2",
+          severity: "unknown",
+        });
+      });
+
+      it("should map an arbitrary severity to unknown for metrics only", async () => {
+        const payload = fullFluxPayload();
+        payload.severity = "critical";
+
+        await postEvent(payload);
+
+        const record = mockRawEmit.mock.calls[0][0];
+        expect(record.attributes["flux.severity"]).toBe("critical");
+        expect(mockEventsCounter.add).toHaveBeenCalledWith(1, {
+          cluster: "production-us-east-1",
+          reason: "reconciliationsucceeded",
+          severity: "unknown",
+        });
+      });
+
+      it("should bound long reason and cluster metric values to 64 characters", async () => {
+        await postEvent({
+          message: "ok",
+          reason: "R".repeat(300),
+          metadata: { cluster: "C".repeat(300) },
+        });
+
+        const attributes = mockEventsCounter.add.mock.calls[0][1];
+        expect(attributes.reason).toHaveLength(64);
+        expect(attributes.cluster).toHaveLength(64);
+        expect(attributes.reason).toMatch(/^[a-z0-9_.:-]+$/);
+        expect(attributes.cluster).toMatch(/^[A-Za-z0-9_.:-]+$/);
+      });
+
+      it("should reuse the same metric series for identical events", async () => {
+        await postEvent(fullFluxPayload());
+        await postEvent(fullFluxPayload());
+
+        expect(mockEventsCounter.add).toHaveBeenCalledTimes(2);
+        expect(mockEventsCounter.add.mock.calls[0][1]).toEqual(
+          mockEventsCounter.add.mock.calls[1][1],
+        );
       });
     });
   });
