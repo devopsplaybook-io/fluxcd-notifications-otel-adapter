@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   merge-build:
-    uses: devopsplaybook-io/common-utils/.github/workflows/reusable-merge-build.yml@f132584acb5d712c571012e7dfbbeba6a92efe93
+    uses: devopsplaybook-io/common-utils/.github/workflows/reusable-merge-build.yml@039402a1c1bc53a91546a7e126070e834a5d097a
     with:
       node_app_directories: '["."]'
       node_version: "26"
