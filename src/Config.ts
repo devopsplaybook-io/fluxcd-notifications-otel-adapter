@@ -1,4 +1,5 @@
-import { ConfigBase } from "@devopsplaybook.io/common-utils";
+import { ConfigBase } from "@devopsplaybook.io/common-utils/config";
+import type { ConsoleLogMode } from "@devopsplaybook.io/otel-utils";
 import { OTelLogger } from "./OTelContext";
 
 const logger = OTelLogger().createModuleLogger("config");
@@ -17,6 +18,8 @@ export class Config extends ConfigBase {
   // Fastify trustProxy: empty (direct peer), true (trust every X-Forwarded-For)
   // or a comma-separated list of trusted proxy addresses/CIDR ranges.
   public TRUST_PROXY = "";
+  // Console mirroring for module-logger records: always, fallback or never.
+  public OPENTELEMETRY_CONSOLE_LOG_MODE: ConsoleLogMode = "always";
 
   constructor() {
     super("fluxcd-notifications");
@@ -27,6 +30,7 @@ export class Config extends ConfigBase {
     this.addConfigField({ field: "WEBHOOK_AUTH_REQUIRED" });
     this.addConfigField({ field: "WEBHOOK_RATE_LIMIT_PER_MINUTE" });
     this.addConfigField({ field: "TRUST_PROXY" });
+    this.addConfigField({ field: "OPENTELEMETRY_CONSOLE_LOG_MODE" });
     // ConfigBase defaults VERSION to the shared library's version; telemetry
     // must report this application's version instead.
     this.VERSION = APP_VERSION;

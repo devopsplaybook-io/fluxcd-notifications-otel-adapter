@@ -5,7 +5,7 @@ const mockOTelSetMeter = jest.fn();
 const mockOTelMeter = jest.fn();
 const mockOTelLogger = jest.fn();
 
-jest.mock("@devopsplaybook.io/common-utils", () => ({
+jest.mock("@devopsplaybook.io/common-utils/otel", () => ({
   createOTelContext: jest.fn(() => ({
     OTelSetTracer: mockOTelSetTracer,
     OTelTracer: mockOTelTracer,

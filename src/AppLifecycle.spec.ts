@@ -62,12 +62,6 @@ jest.mock("./Config", () => ({
   Config: jest.fn(() => mockConfig),
 }));
 
-const mockWatchFile = jest.fn();
-
-jest.mock("fs-extra", () => ({
-  watchFile: mockWatchFile,
-}));
-
 const mockFastifyListen = jest.fn();
 const mockFastifyClose = jest.fn();
 const mockFastifyInstance = {
@@ -160,7 +154,6 @@ describe("App lifecycle", () => {
     expect(mockAppLogger.info).toHaveBeenCalledWith(
       expect.stringContaining("TRUST_PROXY is off"),
     );
-    expect(mockWatchFile).not.toHaveBeenCalled();
   });
 
   it("should pass a CIDR list to Fastify and log the client IP model", async () => {

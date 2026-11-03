@@ -3,7 +3,7 @@ FROM node:26-alpine AS builder
 
 WORKDIR /opt/src
 
-RUN apk add --no-cache bash git python3 perl alpine-sdk
+RUN apk add --no-cache python3 perl alpine-sdk
 
 COPY package.json package-lock.json ./
 RUN npm ci

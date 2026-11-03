@@ -384,6 +384,7 @@ function normalizedMethod(method: string): string {
 export function registerRoutes(fastify: FastifyInstance, config: Config): void {
   const logger = OTelLogger().createModuleLogger(FLUX_NOTIFICATIONS_MODULE);
   const otelLogger = OTelLogger().getLogger();
+  const consoleLogMode = config.OPENTELEMETRY_CONSOLE_LOG_MODE;
   const eventsTotal = OTelMeter().createCounter("events_total");
   const rejectedEventsTotal = OTelMeter().createCounter("rejected_events_total");
 
@@ -633,9 +634,20 @@ export function registerRoutes(fastify: FastifyInstance, config: Config): void {
           context: OTelRequestContext(request),
           timestamp: resolveTimestamp(event.timestamp),
         });
-        console.log(
-          `[${logLevel}] [${FLUX_NOTIFICATIONS_MODULE}] ${sanitizeForConsole(bodyText)}`,
-        );
+        // The structured record is already emitted above; mirror it to the
+        // console in the module-logger format unless the mode suppresses the
+        // mirror while a collector exists ("fallback") or unconditionally
+        // ("never"). An invalid value follows otel-utils' "always" default.
+        if (consoleLogMode !== "never" && consoleLogMode !== "fallback") {
+          const line = `[${logLevel}] [${FLUX_NOTIFICATIONS_MODULE}] ${sanitizeForConsole(bodyText)}`;
+          if (logLevel === "error") {
+            console.error(line);
+          } else if (logLevel === "warn") {
+            console.warn(line);
+          } else {
+            console.log(line);
+          }
+        }
       } else {
         // No OTel logger configured (collector endpoint unset): ModuleLogger
         // still prints the record to the console for pod logs.
