@@ -22,8 +22,11 @@ export interface AppOptions {
 
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 10_000;
 
-// A full 2 048-record log batch is bounded to tens of MiB with a 64 KiB body
-// limit and the 16 KiB message cap; raise it only with a documented reason.
+// A worst-case record is a 16 384-code-point message (up to ~64 KiB of UTF-16
+// data) plus ~10 KiB of 256-code-point attributes and record overhead (~75 KiB);
+// a full 2 048-record queue can retain roughly 150 MiB, and an in-flight export
+// can hold a second copy (~300 MiB). Raise the queue or lower the caps only
+// with a documented memory budget.
 export const FASTIFY_OPTIONS: FastifyServerOptions = {
   bodyLimit: 64 * 1024,
   connectionTimeout: 10_000,

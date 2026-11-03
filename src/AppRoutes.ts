@@ -18,8 +18,10 @@ import { RateLimiter, resolveRateLimitPerMinute } from "./RateLimiter";
 const FLUX_NOTIFICATIONS_MODULE = "fluxcd-notifications";
 
 export const MAX_MESSAGE_LENGTH = 16 * 1024;
-export const MAX_REASON_LENGTH = 256;
-export const MAX_CLUSTER_LENGTH = 256;
+// Every input-derived string attribute is bounded to this many code points.
+export const MAX_ATTRIBUTE_LENGTH = 256;
+export const MAX_REASON_LENGTH = MAX_ATTRIBUTE_LENGTH;
+export const MAX_CLUSTER_LENGTH = MAX_ATTRIBUTE_LENGTH;
 export const MAX_METRIC_ATTRIBUTE_LENGTH = 64;
 
 const MAX_EXCERPT_LENGTH = 200;
@@ -69,14 +71,15 @@ export interface FluxEventPayload {
   timestamp?: string;
 }
 
-function mapSeverity(severity: string | undefined): {
+function mapSeverity(severity: unknown): {
   fluxSeverity: string;
   metricSeverity: MetricSeverity;
   severityNumber: SeverityNumber;
   severityText: string;
   logLevel: LogLevel;
 } {
-  const normalized = severity?.trim().toLowerCase();
+  const normalized =
+    typeof severity === "string" ? severity.trim().toLowerCase() : "";
   switch (normalized) {
     case "error":
       return {
@@ -109,38 +112,122 @@ function mapSeverity(severity: string | undefined): {
 // Console (and ModuleLogger fallback) rendering only: strip ANSI escape
 // sequences and control characters so an event cannot forge log lines. The
 // OTel record body and flux.* attributes keep the raw values on purpose.
-function sanitizeForConsole(value: string): string {
-  return value
-    // eslint-disable-next-line no-control-regex
-    .replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/g, "") // OSC sequences
-    // eslint-disable-next-line no-control-regex
-    .replace(/\u001b\[[0-9;:?]*[ -/]*[@-~]/g, "") // CSI sequences
-    // eslint-disable-next-line no-control-regex
-    .replace(/\u001b[@-_]/g, "") // other two-character escapes
-    // eslint-disable-next-line no-control-regex
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, " ");
+// A single left-to-right scan keeps this linear even for adversarial input
+// such as many repeated OSC starts without a terminator.
+export function sanitizeForConsole(value: string): string {
+  let out = "";
+  let runStart = 0;
+  let i = 0;
+  while (i < value.length) {
+    const code = value.charCodeAt(i);
+    if (code === 0x1b) {
+      const next = value.charCodeAt(i + 1);
+      if (next === 0x5d) {
+        // OSC: ESC ] ... BEL or ESC \. Without a terminator the remainder is
+        // dropped so the scan never revisits the same input.
+        out += value.slice(runStart, i);
+        let j = i + 2;
+        while (j < value.length) {
+          const c = value.charCodeAt(j);
+          if (c === 0x07) {
+            j += 1;
+            break;
+          }
+          if (c === 0x1b && value.charCodeAt(j + 1) === 0x5c) {
+            j += 2;
+            break;
+          }
+          j += 1;
+        }
+        i = j;
+        runStart = i;
+        continue;
+      }
+      if (next === 0x5b) {
+        // CSI: ESC [ params intermediates final
+        let j = i + 2;
+        while (j < value.length) {
+          const c = value.charCodeAt(j);
+          if (
+            (c >= 0x30 && c <= 0x39) ||
+            c === 0x3a ||
+            c === 0x3b ||
+            c === 0x3f
+          ) {
+            j++;
+          } else {
+            break;
+          }
+        }
+        while (
+          j < value.length &&
+          value.charCodeAt(j) >= 0x20 &&
+          value.charCodeAt(j) <= 0x2f
+        ) {
+          j++;
+        }
+        const final = j < value.length ? value.charCodeAt(j) : 0;
+        out += value.slice(runStart, i);
+        if (final >= 0x40 && final <= 0x7e) {
+          i = j + 1;
+        } else {
+          // Incomplete CSI: drop ESC [ only, keep scanning the payload.
+          i += 2;
+        }
+        runStart = i;
+        continue;
+      }
+      if (next >= 0x40 && next <= 0x5f) {
+        // Other two-character escape (e.g. ESC M).
+        out += value.slice(runStart, i);
+        i += 2;
+        runStart = i;
+        continue;
+      }
+    }
+    if (code <= 0x1f || (code >= 0x7f && code <= 0x9f)) {
+      out += value.slice(runStart, i) + " ";
+      i += 1;
+      runStart = i;
+      continue;
+    }
+    i += 1;
+  }
+  return out + value.slice(runStart);
 }
 
 function payloadExcerpt(body: unknown): string {
   if (typeof body === "string") {
-    return body.slice(0, MAX_EXCERPT_LENGTH);
+    return truncate(body, MAX_EXCERPT_LENGTH);
   }
   // Bound the inspection so a large payload is never fully stringified.
-  return inspect(body, {
-    depth: 1,
-    maxArrayLength: 10,
-    maxStringLength: MAX_EXCERPT_LENGTH,
-    breakLength: Infinity,
-  }).slice(0, MAX_EXCERPT_LENGTH);
+  return truncate(
+    inspect(body, {
+      depth: 1,
+      maxArrayLength: 10,
+      maxStringLength: MAX_EXCERPT_LENGTH,
+      breakLength: Infinity,
+    }),
+    MAX_EXCERPT_LENGTH,
+  );
+}
+
+function boundAttribute(value: string, onTruncated: () => void): string {
+  const bounded = truncate(value, MAX_ATTRIBUTE_LENGTH);
+  if (bounded !== value) {
+    onTruncated();
+  }
+  return bounded;
 }
 
 function setIfPresent(
   attributes: Record<string, string | boolean>,
   key: string,
   value: unknown,
+  onTruncated: () => void,
 ): void {
   if (typeof value === "string" && value) {
-    attributes[key] = value;
+    attributes[key] = boundAttribute(value, onTruncated);
   }
 }
 
@@ -163,8 +250,18 @@ function findRevision(
   return firstRemaining ? revisions.get(firstRemaining) : undefined;
 }
 
-function truncate(value: string, maxLength: number): string {
-  return value.length > maxLength ? value.slice(0, maxLength) : value;
+// Counts Unicode code points so truncation never splits a surrogate pair.
+export function truncate(value: string, maxLength: number): string {
+  if (maxLength <= 0) return "";
+  if (value.length <= maxLength) return value; // code points <= code units
+  let codePoints = 0;
+  let index = 0;
+  for (const char of value) {
+    if (codePoints === maxLength) break;
+    codePoints += 1;
+    index += char.length;
+  }
+  return index >= value.length ? value : value.slice(0, index);
 }
 
 function resolveTimestamp(value: unknown): number {
@@ -186,21 +283,25 @@ function resolveTimestamp(value: unknown): number {
 // Metric labels are normalized to a bounded, low-cardinality set; the raw
 // values stay in the log record and body.
 export function normalizeMetricReason(raw: string): string {
-  const normalized = raw
-    .trim()
-    .toLowerCase()
-    .replace(/[^a-z0-9_.:-]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, MAX_METRIC_ATTRIBUTE_LENGTH);
+  const normalized = truncate(
+    raw
+      .trim()
+      .toLowerCase()
+      .replace(/[^a-z0-9_.:-]+/g, "_")
+      .replace(/^_+|_+$/g, ""),
+    MAX_METRIC_ATTRIBUTE_LENGTH,
+  );
   return normalized || "unknown";
 }
 
 export function normalizeMetricCluster(raw: string): string {
-  const normalized = raw
-    .trim()
-    .replace(/[^A-Za-z0-9_.:-]+/g, "_")
-    .replace(/^_+|_+$/g, "")
-    .slice(0, MAX_METRIC_ATTRIBUTE_LENGTH);
+  const normalized = truncate(
+    raw
+      .trim()
+      .replace(/[^A-Za-z0-9_.:-]+/g, "_")
+      .replace(/^_+|_+$/g, ""),
+    MAX_METRIC_ATTRIBUTE_LENGTH,
+  );
   return normalized || "unknown";
 }
 
@@ -245,6 +346,11 @@ function sendError(
   };
   if (headers) {
     reply.headers(headers);
+  }
+  if (statusCode >= 500) {
+    // Never leak internal error messages; details stay in the server logs.
+    reply.status(statusCode).send({ statusCode, error: "Internal Server Error" });
+    return;
   }
   reply.status(statusCode).send(error);
 }
@@ -299,119 +405,180 @@ export function registerRoutes(fastify: FastifyInstance, config: Config): void {
     await reply.status(429).send({ error: "Too Many Requests" });
   };
 
-  fastify.get("/api/status", async () => {
-    return { started: true, version: config.VERSION };
-  });
-
-  fastify.post("/", { onRequest: rateLimitHook }, async (request, reply) => {
+  // onRequest runs before body parsing, so an unauthenticated body is never
+  // read. Rate limiting is registered first and therefore still wins (429).
+  const authHook = async (
+    request: FastifyRequest,
+    reply: FastifyReply,
+  ): Promise<void> => {
+    if (!config.WEBHOOK_AUTHORIZATION_HEADER) {
+      return;
+    }
     if (
-      config.WEBHOOK_AUTHORIZATION_HEADER &&
-      !isAuthorized(
+      isAuthorized(
         request.headers.authorization,
         config.WEBHOOK_AUTHORIZATION_HEADER,
       )
     ) {
-      recordRejection(request, 401, "unauthorized");
-      reply.header("WWW-Authenticate", "Bearer");
-      reply.status(401).send({ error: "Unauthorized" });
       return;
     }
+    recordRejection(request, 401, "unauthorized");
+    reply.header("WWW-Authenticate", "Bearer");
+    await reply.status(401).send({ error: "Unauthorized" });
+  };
 
-    const event = request.body as FluxEventPayload | null | undefined;
-    const message =
-      event && typeof event === "object" && typeof event.message === "string"
-        ? event.message.trim()
-        : "";
-    if (!event || typeof event !== "object" || !message) {
-      recordRejection(
-        request,
-        400,
-        "invalid_payload",
-        `excerpt=${truncate(sanitizeForConsole(payloadExcerpt(request.body)), MAX_EXCERPT_LENGTH)}`,
-      );
-      reply.status(400).send({ error: "Bad Request" });
-      return;
-    }
+  fastify.get("/api/status", async () => {
+    return { started: true, version: config.VERSION };
+  });
 
-    const rawReason =
-      typeof event.reason === "string" ? event.reason.trim() : "";
-    const reason = truncate(rawReason || "unknown", MAX_REASON_LENGTH);
-    const rawCluster =
-      typeof event.metadata?.cluster === "string"
-        ? event.metadata.cluster.trim()
-        : "";
-    const cluster = truncate(rawCluster || "unknown", MAX_CLUSTER_LENGTH);
-    const messageTruncated = message.length > MAX_MESSAGE_LENGTH;
-    const emittedMessage = truncate(message, MAX_MESSAGE_LENGTH);
-    const { fluxSeverity, metricSeverity, severityNumber, severityText, logLevel } =
-      mapSeverity(event.severity);
-    const bodyText = `${cluster}: ${reason} - ${emittedMessage}`;
+  fastify.post(
+    "/",
+    { onRequest: [rateLimitHook, authHook] },
+    async (request, reply) => {
+      let attributesTruncated = false;
+      const markAttributeTruncated = (): void => {
+        attributesTruncated = true;
+      };
 
-    const attributes: Record<string, string | boolean> = {
-      "flux.cluster": cluster,
-      "flux.reason": reason,
-      "flux.severity": fluxSeverity,
-    };
-    if (messageTruncated) {
-      attributes["flux.message.truncated"] = true;
-    }
-    const involvedObject = event.involvedObject;
-    if (involvedObject && typeof involvedObject === "object") {
-      setIfPresent(attributes, "flux.object.kind", involvedObject.kind);
-      setIfPresent(attributes, "flux.object.name", involvedObject.name);
-      setIfPresent(attributes, "flux.object.namespace", involvedObject.namespace);
-      setIfPresent(attributes, "flux.object.apiVersion", involvedObject.apiVersion);
-      setIfPresent(attributes, "flux.object.uid", involvedObject.uid);
-    }
-    const revision = findRevision(event.metadata);
-    if (revision) {
-      attributes["flux.revision"] = revision;
-    }
-    setIfPresent(
-      attributes,
-      "flux.reporting_controller",
-      event.reportingController,
-    );
-
-    if (otelLogger) {
-      // otel-light correlates logs from the trace.id/span.id attributes only,
-      // not from the OTLP traceId/spanId fields of the record.
-      const spanContext = OTelRequestSpan(request)?.spanContext();
-      if (spanContext?.traceId && spanContext?.spanId) {
-        attributes["trace.id"] = spanContext.traceId;
-        attributes["span.id"] = spanContext.spanId;
+      const event = request.body as FluxEventPayload | null | undefined;
+      const message =
+        event && typeof event === "object" && typeof event.message === "string"
+          ? event.message.trim()
+          : "";
+      if (!event || typeof event !== "object" || !message) {
+        recordRejection(
+          request,
+          400,
+          "invalid_payload",
+          `excerpt=${truncate(sanitizeForConsole(payloadExcerpt(request.body)), MAX_EXCERPT_LENGTH)}`,
+        );
+        reply.status(400).send({ error: "Bad Request" });
+        return;
       }
-      otelLogger.emit({
+
+      const rawReason =
+        typeof event.reason === "string" ? event.reason.trim() : "";
+      const reason = boundAttribute(
+        rawReason || "unknown",
+        markAttributeTruncated,
+      );
+      const rawCluster =
+        typeof event.metadata?.cluster === "string"
+          ? event.metadata.cluster.trim()
+          : "";
+      const cluster = boundAttribute(
+        rawCluster || "unknown",
+        markAttributeTruncated,
+      );
+      const emittedMessage = truncate(message, MAX_MESSAGE_LENGTH);
+      const messageTruncated = emittedMessage !== message;
+      const {
+        fluxSeverity,
+        metricSeverity,
         severityNumber,
         severityText,
-        body: bodyText,
-        attributes,
-        context: OTelRequestContext(request),
-        timestamp: resolveTimestamp(event.timestamp),
-      });
-      console.log(
-        `[${logLevel}] [${FLUX_NOTIFICATIONS_MODULE}] ${sanitizeForConsole(bodyText)}`,
-      );
-    } else {
-      // No OTel logger configured (collector endpoint unset): ModuleLogger
-      // still prints the record to the console for pod logs.
-      const fallbackBody = sanitizeForConsole(bodyText);
-      if (logLevel === "error") {
-        logger.error(fallbackBody);
-      } else if (logLevel === "warn") {
-        logger.warn(fallbackBody);
-      } else {
-        logger.info(fallbackBody);
-      }
-    }
+        logLevel,
+      } = mapSeverity(event.severity);
+      const bodyText = `${cluster}: ${reason} - ${emittedMessage}`;
 
-    eventsTotal.add(1, {
-      cluster: normalizeMetricCluster(cluster),
-      reason: normalizeMetricReason(reason),
-      severity: metricSeverity,
-    });
-    reply.status(200).send({ status: "ok" });
-  });
+      const attributes: Record<string, string | boolean> = {
+        "flux.cluster": cluster,
+        "flux.reason": reason,
+        "flux.severity": boundAttribute(fluxSeverity, markAttributeTruncated),
+      };
+      if (messageTruncated) {
+        attributes["flux.message.truncated"] = true;
+      }
+      const involvedObject = event.involvedObject;
+      if (involvedObject && typeof involvedObject === "object") {
+        setIfPresent(
+          attributes,
+          "flux.object.kind",
+          involvedObject.kind,
+          markAttributeTruncated,
+        );
+        setIfPresent(
+          attributes,
+          "flux.object.name",
+          involvedObject.name,
+          markAttributeTruncated,
+        );
+        setIfPresent(
+          attributes,
+          "flux.object.namespace",
+          involvedObject.namespace,
+          markAttributeTruncated,
+        );
+        setIfPresent(
+          attributes,
+          "flux.object.apiVersion",
+          involvedObject.apiVersion,
+          markAttributeTruncated,
+        );
+        setIfPresent(
+          attributes,
+          "flux.object.uid",
+          involvedObject.uid,
+          markAttributeTruncated,
+        );
+      }
+      const revision = findRevision(event.metadata);
+      if (revision) {
+        attributes["flux.revision"] = boundAttribute(
+          revision,
+          markAttributeTruncated,
+        );
+      }
+      setIfPresent(
+        attributes,
+        "flux.reporting_controller",
+        event.reportingController,
+        markAttributeTruncated,
+      );
+      if (attributesTruncated) {
+        attributes["flux.attributes.truncated"] = true;
+      }
+
+      if (otelLogger) {
+        // otel-light correlates logs from the trace.id/span.id attributes only,
+        // not from the OTLP traceId/spanId fields of the record.
+        const spanContext = OTelRequestSpan(request)?.spanContext();
+        if (spanContext?.traceId && spanContext?.spanId) {
+          attributes["trace.id"] = spanContext.traceId;
+          attributes["span.id"] = spanContext.spanId;
+        }
+        otelLogger.emit({
+          severityNumber,
+          severityText,
+          body: bodyText,
+          attributes,
+          context: OTelRequestContext(request),
+          timestamp: resolveTimestamp(event.timestamp),
+        });
+        console.log(
+          `[${logLevel}] [${FLUX_NOTIFICATIONS_MODULE}] ${sanitizeForConsole(bodyText)}`,
+        );
+      } else {
+        // No OTel logger configured (collector endpoint unset): ModuleLogger
+        // still prints the record to the console for pod logs.
+        const fallbackBody = sanitizeForConsole(bodyText);
+        if (logLevel === "error") {
+          logger.error(fallbackBody);
+        } else if (logLevel === "warn") {
+          logger.warn(fallbackBody);
+        } else {
+          logger.info(fallbackBody);
+        }
+      }
+
+      eventsTotal.add(1, {
+        cluster: normalizeMetricCluster(cluster),
+        reason: normalizeMetricReason(reason),
+        severity: metricSeverity,
+      });
+      reply.status(200).send({ status: "ok" });
+    },
+  );
 
   fastify.setErrorHandler<FastifyError>((error, request, reply) => {
     const statusCode = error.statusCode ?? 500;
@@ -421,7 +588,7 @@ export function registerRoutes(fastify: FastifyInstance, config: Config): void {
     }
     if (statusCode >= 500) {
       logger.error(
-        `Webhook request failed: route=${requestRoute(request)} status=${statusCode} message=${truncate(sanitizeForConsole(error.message), MAX_EXCERPT_LENGTH)}`,
+        `Webhook request failed: route=${requestRoute(request)} status=${statusCode} code=${truncate(sanitizeForConsole(String(error.code ?? "unknown")), MAX_EXCERPT_LENGTH)} message=${truncate(sanitizeForConsole(error.message), MAX_EXCERPT_LENGTH)}`,
       );
       sendError(reply, error, statusCode);
       return;
