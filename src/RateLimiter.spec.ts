@@ -71,6 +71,19 @@ describe("RateLimiter", () => {
     expect(limiter.allow("client", RATE_LIMIT_WINDOW_MS).allowed).toBe(true);
   });
 
+  it("allows up to 2x the limit across a fixed-window boundary", () => {
+    const limiter = new RateLimiter({ limitPerMinute: 2 });
+
+    // The client's window opens on the first request; it can spend the full
+    // limit late in that window...
+    expect(limiter.allow("client", 0).allowed).toBe(true);
+    expect(limiter.allow("client", RATE_LIMIT_WINDOW_MS - 2).allowed).toBe(true);
+    expect(limiter.allow("client", RATE_LIMIT_WINDOW_MS - 1).allowed).toBe(false);
+    // ...and the full limit again just after the boundary: 4 requests in 3 ms.
+    expect(limiter.allow("client", RATE_LIMIT_WINDOW_MS).allowed).toBe(true);
+    expect(limiter.allow("client", RATE_LIMIT_WINDOW_MS + 1).allowed).toBe(true);
+  });
+
   it("tracks clients independently", () => {
     const limiter = new RateLimiter({ limitPerMinute: 1 });
 

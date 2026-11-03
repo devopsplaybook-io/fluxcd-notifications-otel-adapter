@@ -53,6 +53,7 @@ const mockConfig = {
   VERSION: "0.7.0",
   WEBHOOK_AUTHORIZATION_HEADER: "",
   WEBHOOK_RATE_LIMIT_PER_MINUTE: 600,
+  TRUST_PROXY: "",
   reload: mockConfigReload,
 };
 
@@ -92,6 +93,7 @@ beforeEach(() => {
   mockMeterShutdown.mockReset().mockResolvedValue(undefined);
   mockConfig.WEBHOOK_AUTHORIZATION_HEADER = "";
   mockConfig.WEBHOOK_RATE_LIMIT_PER_MINUTE = 600;
+  mockConfig.TRUST_PROXY = "";
   jest.resetModules();
 
   initialSigtermListeners = process.listeners("SIGTERM");
@@ -124,15 +126,25 @@ describe("App lifecycle", () => {
     expect(mockOTelSetTracer).toHaveBeenCalledTimes(1);
     expect(mockOTelSetMeter).toHaveBeenCalledTimes(1);
     expect(mockStandardLogger.initOTel).toHaveBeenCalledWith(mockConfig);
+    expect(mockFastifyFactory).toHaveBeenCalledWith(
+      expect.objectContaining({ trustProxy: false }),
+    );
     expect(mockRegisterHooks).toHaveBeenCalledWith(
       mockFastifyInstance,
       mockStandardTracer,
       mockStandardLogger,
-      { rootApiPath: "/", ignoreList: ["GET-/api/status"] },
+      {
+        rootApiPath: "/",
+        ignoreList: ["GET-/api/status"],
+        unmatchedRouteSpanName: "method",
+      },
     );
     expect(mockRegisterRoutes).toHaveBeenCalledWith(
       mockFastifyInstance,
       mockConfig,
+    );
+    expect(mockRegisterRoutes.mock.invocationCallOrder[0]).toBeLessThan(
+      mockRegisterHooks.mock.invocationCallOrder[0],
     );
     expect(mockFastifyListen).toHaveBeenCalledWith({
       port: 8080,
@@ -143,7 +155,55 @@ describe("App lifecycle", () => {
       "====== Starting fluxcd-notifications-otel-adapter Server ======",
     );
     expect(mockAppLogger.info).toHaveBeenCalledWith("API Listening");
+    expect(mockAppLogger.info).toHaveBeenCalledWith(
+      expect.stringContaining("TRUST_PROXY is off"),
+    );
     expect(mockWatchFile).not.toHaveBeenCalled();
+  });
+
+  it("should pass a CIDR list to Fastify and log the client IP model", async () => {
+    mockConfig.TRUST_PROXY = "10.0.0.0/8, loopback";
+    const { start } = require("./App");
+
+    await start();
+
+    expect(mockFastifyFactory).toHaveBeenCalledWith(
+      expect.objectContaining({
+        trustProxy: ["10.0.0.0/8", "loopback"],
+      }),
+    );
+    expect(mockAppLogger.info).toHaveBeenCalledWith(
+      expect.stringContaining("2 configured proxy address range(s)"),
+    );
+  });
+
+  it("should warn when every forwarded header is trusted", async () => {
+    mockConfig.TRUST_PROXY = "true";
+    const { start } = require("./App");
+
+    await start();
+
+    expect(mockFastifyFactory).toHaveBeenCalledWith(
+      expect.objectContaining({ trustProxy: true }),
+    );
+    expect(mockAppLogger.warn).toHaveBeenCalledWith(
+      expect.stringContaining("TRUST_PROXY=true"),
+    );
+  });
+
+  it("should fail startup for an invalid TRUST_PROXY value", async () => {
+    mockConfig.TRUST_PROXY = "not-an-ip";
+    const exit = jest.fn();
+    const { main } = require("./App");
+
+    await main({ exit });
+
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(mockFastifyListen).not.toHaveBeenCalled();
+    expect(mockAppLogger.error).toHaveBeenCalledWith(
+      "Error starting fluxcd-notifications-otel-adapter",
+      expect.any(Error),
+    );
   });
 
   it("should close fastify, flush telemetry and exit 0 on SIGTERM", async () => {

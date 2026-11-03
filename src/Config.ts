@@ -10,6 +10,9 @@ export class Config extends ConfigBase {
   public WEBHOOK_AUTHORIZATION_HEADER = "";
   // Per-client-IP fixed window; 0 disables the in-process limiter.
   public WEBHOOK_RATE_LIMIT_PER_MINUTE = 600;
+  // Fastify trustProxy: empty (direct peer), true (trust every X-Forwarded-For)
+  // or a comma-separated list of trusted proxy addresses/CIDR ranges.
+  public TRUST_PROXY = "";
 
   constructor() {
     super("fluxcd-notifications");
@@ -18,6 +21,7 @@ export class Config extends ConfigBase {
       sensitive: true,
     });
     this.addConfigField({ field: "WEBHOOK_RATE_LIMIT_PER_MINUTE" });
+    this.addConfigField({ field: "TRUST_PROXY" });
     // ConfigBase defaults VERSION to the shared library's version; telemetry
     // must report this application's version instead.
     this.VERSION = APP_VERSION;

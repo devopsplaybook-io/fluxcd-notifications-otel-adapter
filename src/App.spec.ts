@@ -495,15 +495,56 @@ describe("App API routes", () => {
       });
     });
 
-    it("should bound the payload excerpt of a large rejected body", async () => {
-      const response = await postEvent({ extra: "x".repeat(50_000) });
+    it("should log the rejected body structure and types without values", async () => {
+      const response = await postEvent({
+        message: 42,
+        password: "super-secret-value",
+      });
 
       expect(response.statusCode).toBe(400);
       const warning = mockModuleLogger.warn.mock.calls[0][0] as string;
-      expect(warning.length).toBeLessThan(400);
+      expect(warning).toContain("reason=invalid_payload");
       expect(warning).toContain(
-        "Webhook request rejected: route=POST / status=400 reason=invalid_payload",
+        "body_type=object key_count=2 has_message=true message_type=number",
       );
+      expect(warning).not.toContain("super-secret-value");
+      expect(warning).not.toContain("password");
+    });
+
+    it("should describe an array body without its values", async () => {
+      const response = await postEvent(["secret-array-value"]);
+
+      expect(response.statusCode).toBe(400);
+      const warning = mockModuleLogger.warn.mock.calls[0][0] as string;
+      expect(warning).toContain("body_type=array item_count=1");
+      expect(warning).not.toContain("secret-array-value");
+    });
+
+    it("should describe a null body as null", async () => {
+      const response = await fastify.inject({
+        method: "POST",
+        url: "/",
+        headers: { "content-type": "application/json" },
+        payload: "null",
+      });
+
+      expect(response.statusCode).toBe(400);
+      const warning = mockModuleLogger.warn.mock.calls[0][0] as string;
+      expect(warning).toContain("body_type=null");
+    });
+
+    it("should describe a string body without its value", async () => {
+      const response = await fastify.inject({
+        method: "POST",
+        url: "/",
+        headers: { "content-type": "text/plain" },
+        payload: "secret-string-body",
+      });
+
+      expect(response.statusCode).toBe(400);
+      const warning = mockModuleLogger.warn.mock.calls[0][0] as string;
+      expect(warning).toContain("body_type=string");
+      expect(warning).not.toContain("secret-string-body");
     });
 
     it("should truncate a message longer than 16 KiB and flag it", async () => {
@@ -1035,7 +1076,7 @@ describe("App API routes", () => {
         });
       });
 
-      it("should count an unknown route once and preserve the default 404 body", async () => {
+      it("should count an unknown route once and log it at INFO", async () => {
         const response = await fastify.inject({ method: "GET", url: "/nope" });
 
         expect(response.statusCode).toBe(404);
@@ -1048,7 +1089,11 @@ describe("App API routes", () => {
         expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
           reason: "bad_request",
         });
-        expect(mockModuleLogger.warn).toHaveBeenCalledTimes(1);
+        expect(mockModuleLogger.info).toHaveBeenCalledTimes(1);
+        expect(mockModuleLogger.info).toHaveBeenCalledWith(
+          "Webhook request rejected: route=GET /nope status=404 reason=bad_request",
+        );
+        expect(mockModuleLogger.warn).not.toHaveBeenCalled();
       });
     });
 
@@ -1087,6 +1132,142 @@ describe("App API routes", () => {
         }
         expect(mockEventsCounter.add).toHaveBeenCalledTimes(5);
         expect(mockRejectedEventsCounter.add).not.toHaveBeenCalled();
+      });
+
+      it("should rate limit unknown routes and /api/status as well", async () => {
+        config = buildConfig({ WEBHOOK_RATE_LIMIT_PER_MINUTE: 1 });
+        fastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
+        registerRoutes(fastify, config);
+
+        const first = await fastify.inject({ method: "GET", url: "/nope-1" });
+        const second = await fastify.inject({
+          method: "GET",
+          url: "/api/status",
+        });
+        const third = await fastify.inject({ method: "GET", url: "/nope-2" });
+
+        expect(first.statusCode).toBe(404);
+        expect(second.statusCode).toBe(429);
+        expect(third.statusCode).toBe(429);
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
+          reason: "rate_limited",
+        });
+      });
+
+      it("should answer 429 before 401 on the authenticated route", async () => {
+        config = buildConfig({
+          WEBHOOK_RATE_LIMIT_PER_MINUTE: 1,
+          WEBHOOK_AUTHORIZATION_HEADER: "Bearer s3cr3t",
+        });
+        fastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
+        registerRoutes(fastify, config);
+
+        const first = await postEvent(fullFluxPayload());
+        const second = await postEvent(fullFluxPayload());
+
+        expect(first.statusCode).toBe(401);
+        expect(second.statusCode).toBe(429);
+        expect(second.headers["www-authenticate"]).toBeUndefined();
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
+          reason: "unauthorized",
+        });
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
+          reason: "rate_limited",
+        });
+      });
+    });
+
+    describe("rejection log sampling", () => {
+      it("should log one INFO line for a 404 flood and count every request", async () => {
+        config = buildConfig({ WEBHOOK_RATE_LIMIT_PER_MINUTE: 0 });
+        fastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
+        registerRoutes(fastify, config);
+
+        for (let i = 0; i < 5; i++) {
+          const response = await fastify.inject({
+            method: "GET",
+            url: `/nope-${i}`,
+          });
+          expect(response.statusCode).toBe(404);
+        }
+
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledTimes(5);
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
+          reason: "bad_request",
+        });
+        expect(mockModuleLogger.info).toHaveBeenCalledTimes(1);
+        expect(mockModuleLogger.warn).not.toHaveBeenCalled();
+      });
+
+      it("should sample independently per sampling key", async () => {
+        config = buildConfig({ WEBHOOK_RATE_LIMIT_PER_MINUTE: 0 });
+        fastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
+        registerRoutes(fastify, config);
+
+        await fastify.inject({ method: "GET", url: "/a" });
+        await fastify.inject({ method: "POST", url: "/b" });
+        await fastify.inject({ method: "GET", url: "/c" });
+
+        expect(mockModuleLogger.info).toHaveBeenCalledTimes(2);
+      });
+
+      it("should report the suppressed count on the next window", async () => {
+        config = buildConfig({ WEBHOOK_RATE_LIMIT_PER_MINUTE: 0 });
+        fastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
+        registerRoutes(fastify, config);
+        const nowSpy = jest.spyOn(Date, "now").mockReturnValue(1_000);
+
+        await fastify.inject({ method: "GET", url: "/nope" });
+        await fastify.inject({ method: "GET", url: "/nope" });
+        await fastify.inject({ method: "GET", url: "/nope" });
+        nowSpy.mockReturnValue(1_000 + 60_000);
+        await fastify.inject({ method: "GET", url: "/nope" });
+
+        expect(mockModuleLogger.info).toHaveBeenCalledTimes(2);
+        const lines = mockModuleLogger.info.mock.calls.map(
+          (call) => call[0] as string,
+        );
+        expect(lines[0]).not.toContain("suppressed=");
+        expect(lines[1]).toContain("suppressed=2");
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledTimes(4);
+      });
+    });
+
+    describe("trustProxy client keys", () => {
+      function forwardedRequest(client: string) {
+        return {
+          method: "GET" as const,
+          url: "/nope",
+          headers: { "x-forwarded-for": client },
+        };
+      }
+
+      it("should keep a separate bucket per forwarded client when enabled", async () => {
+        config = buildConfig({ WEBHOOK_RATE_LIMIT_PER_MINUTE: 1 });
+        fastify = Fastify({ logger: false, ...FASTIFY_OPTIONS, trustProxy: true });
+        registerRoutes(fastify, config);
+
+        expect((await fastify.inject(forwardedRequest("203.0.113.1"))).statusCode).toBe(404);
+        expect((await fastify.inject(forwardedRequest("203.0.113.1"))).statusCode).toBe(429);
+        expect((await fastify.inject(forwardedRequest("203.0.113.2"))).statusCode).toBe(404);
+      });
+
+      it("should share the socket bucket when disabled", async () => {
+        config = buildConfig({ WEBHOOK_RATE_LIMIT_PER_MINUTE: 1 });
+        fastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
+        registerRoutes(fastify, config);
+
+        expect((await fastify.inject(forwardedRequest("203.0.113.1"))).statusCode).toBe(404);
+        expect((await fastify.inject(forwardedRequest("203.0.113.2"))).statusCode).toBe(429);
+      });
+
+      it("should fall back to the socket address for a malformed X-Forwarded-For", async () => {
+        config = buildConfig({ WEBHOOK_RATE_LIMIT_PER_MINUTE: 1 });
+        fastify = Fastify({ logger: false, ...FASTIFY_OPTIONS, trustProxy: true });
+        registerRoutes(fastify, config);
+
+        expect((await fastify.inject(forwardedRequest("garbage"))).statusCode).toBe(404);
+        expect((await fastify.inject(forwardedRequest("also-garbage"))).statusCode).toBe(429);
       });
     });
 

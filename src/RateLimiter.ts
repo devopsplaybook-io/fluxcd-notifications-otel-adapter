@@ -33,6 +33,16 @@ export interface RateLimitDecision {
 
 // Lightweight in-process fixed-window limiter. This is one in-cluster layer:
 // network policies and ingress rate limiting are the complementary controls.
+//
+// Properties to keep in mind when sizing it:
+// - The fixed 60 s window is not a sliding window: a client can spend the full
+//   limit at the end of one window and the full limit at the start of the next,
+//   so up to 2x the limit can pass across a boundary.
+// - makeRoom() scans the whole map (at most 10 000 entries) on overflow, purges
+//   expired windows, then evicts the oldest window. Eviction resets that
+//   client's counter, so the cap is a memory bound, not a hard global guarantee.
+// - There is no global cap: worst-case admitted traffic is approximately
+//   tracked clients x limit per minute. Use the ingress to limit aggregates.
 export class RateLimiter {
   private readonly limitPerMinute: number;
   private readonly windowMs: number;
@@ -86,6 +96,8 @@ export class RateLimiter {
     return { allowed: true, retryAfterSeconds: 0 };
   }
 
+  // Full-map scan on overflow (bounded by maxTrackedClients); expired windows
+  // go first, then the oldest window is evicted and its counter resets.
   private makeRoom(now: number): void {
     if (this.windows.size < this.maxTrackedClients) {
       return;

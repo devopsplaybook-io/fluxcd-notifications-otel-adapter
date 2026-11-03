@@ -10,10 +10,11 @@ import type {
   FastifyRequest,
 } from "fastify";
 import { timingSafeEqual } from "node:crypto";
-import { inspect } from "node:util";
+import { isIP } from "node:net";
 import type { Config } from "./Config";
 import { OTelLogger, OTelMeter } from "./OTelContext";
 import { RateLimiter, resolveRateLimitPerMinute } from "./RateLimiter";
+import { RejectionLogSampler } from "./RejectionLogSampler";
 
 const FLUX_NOTIFICATIONS_MODULE = "fluxcd-notifications";
 
@@ -196,20 +197,29 @@ export function sanitizeForConsole(value: string): string {
   return out + value.slice(runStart);
 }
 
-function payloadExcerpt(body: unknown): string {
-  if (typeof body === "string") {
-    return truncate(body, MAX_EXCERPT_LENGTH);
+// Rejected bodies can contain credentials: describe the structure and types
+// only, never key names, excerpts or values.
+export function describeRequestBody(body: unknown): string {
+  if (body === null) {
+    return "body_type=null";
   }
-  // Bound the inspection so a large payload is never fully stringified.
-  return truncate(
-    inspect(body, {
-      depth: 1,
-      maxArrayLength: 10,
-      maxStringLength: MAX_EXCERPT_LENGTH,
-      breakLength: Infinity,
-    }),
-    MAX_EXCERPT_LENGTH,
-  );
+  if (body === undefined) {
+    return "body_type=undefined";
+  }
+  if (Array.isArray(body)) {
+    return `body_type=array item_count=${body.length}`;
+  }
+  if (typeof body !== "object") {
+    return `body_type=${typeof body}`;
+  }
+  const keys = Object.keys(body);
+  const hasMessage = Object.prototype.hasOwnProperty.call(body, "message");
+  const messageType = hasMessage
+    ? typeof (body as Record<string, unknown>).message
+    : undefined;
+  return hasMessage
+    ? `body_type=object key_count=${keys.length} has_message=true message_type=${messageType}`
+    : `body_type=object key_count=${keys.length} has_message=false`;
 }
 
 function boundAttribute(value: string, onTruncated: () => void): string {
@@ -355,6 +365,22 @@ function sendError(
   reply.status(statusCode).send(error);
 }
 
+const STANDARD_HTTP_METHODS = new Set([
+  "GET",
+  "HEAD",
+  "POST",
+  "PUT",
+  "PATCH",
+  "DELETE",
+  "OPTIONS",
+  "TRACE",
+]);
+
+function normalizedMethod(method: string): string {
+  const upper = method.toUpperCase();
+  return STANDARD_HTTP_METHODS.has(upper) ? upper : "OTHER";
+}
+
 export function registerRoutes(fastify: FastifyInstance, config: Config): void {
   const logger = OTelLogger().createModuleLogger(FLUX_NOTIFICATIONS_MODULE);
   const otelLogger = OTelLogger().getLogger();
@@ -365,19 +391,48 @@ export function registerRoutes(fastify: FastifyInstance, config: Config): void {
   // so the error handler never counts the same rejection twice.
   const rejectedRequests = new WeakSet<object>();
 
-  const requestRoute = (request: FastifyRequest): string =>
-    `${request.method} ${truncate(sanitizeForConsole(request.url), MAX_ROUTE_LENGTH)}`;
+  // One sampler per server instance; metrics stay exact, only the log line is
+  // sampled (first event per method/route/status/reason per 60 s window).
+  const rejectionLogSampler = new RejectionLogSampler();
+
+  const requestRoute = (request: FastifyRequest): string => {
+    const path = request.url.split("?")[0];
+    return `${request.method} ${truncate(sanitizeForConsole(path), MAX_ROUTE_LENGTH)}`;
+  };
+
+  // The route template (never the raw path) keeps the sampling-key space small;
+  // unknown routes use a fixed placeholder because routeOptions.url is absent.
+  const rejectionSamplingKey = (
+    request: FastifyRequest,
+    status: number,
+    reason: RejectionReason,
+  ): string =>
+    `${normalizedMethod(request.method)} ${request.routeOptions?.url ?? "unmatched"} ${status} ${reason}`;
 
   const recordRejection = (
     request: FastifyRequest,
     status: number,
     reason: RejectionReason,
     detail?: string,
+    level: "info" | "warn" = "warn",
   ): void => {
     rejectedRequests.add(request);
     rejectedEventsTotal.add(1, { reason });
-    const message = `Webhook request rejected: route=${requestRoute(request)} status=${status} reason=${reason}`;
-    logger.warn(detail ? `${message} ${detail}` : message);
+    const decision = rejectionLogSampler.check(
+      rejectionSamplingKey(request, status, reason),
+    );
+    if (!decision.log) {
+      return;
+    }
+    const suppressed =
+      decision.suppressed > 0 ? ` suppressed=${decision.suppressed}` : "";
+    const message = `Webhook request rejected: route=${requestRoute(request)} status=${status} reason=${reason}${suppressed}`;
+    const line = detail ? `${message} ${detail}` : message;
+    if (level === "info") {
+      logger.info(line);
+    } else {
+      logger.warn(line);
+    }
   };
 
   const rateLimiter = new RateLimiter({
@@ -386,12 +441,29 @@ export function registerRoutes(fastify: FastifyInstance, config: Config): void {
     ),
   });
 
+  // Key on the client IP only. Never key on the authorization token: it is
+  // shared by every Flux event, so one token would mean one global bucket.
+  const clientKey = (request: FastifyRequest): string => {
+    const ip = request.ip;
+    if (isIP(ip) !== 0) {
+      return ip;
+    }
+    // With trustProxy, a malformed X-Forwarded-For value makes request.ip an
+    // arbitrary string; fall back to the validated socket address so the
+    // limiter map keeps a bounded, non-spoofable key space.
+    const remoteAddress = request.socket.remoteAddress;
+    if (typeof remoteAddress === "string" && isIP(remoteAddress) !== 0) {
+      return remoteAddress;
+    }
+    return "unknown";
+  };
+
   // onRequest runs before body parsing, so an over-limit body is never read.
   const rateLimitHook = async (
     request: FastifyRequest,
     reply: FastifyReply,
   ): Promise<void> => {
-    const decision = rateLimiter.allow(request.ip);
+    const decision = rateLimiter.allow(clientKey(request));
     if (decision.allowed) {
       return;
     }
@@ -404,6 +476,12 @@ export function registerRoutes(fastify: FastifyInstance, config: Config): void {
     reply.header("Retry-After", String(decision.retryAfterSeconds));
     await reply.status(429).send({ error: "Too Many Requests" });
   };
+
+  // Root-level hooks also run for unmatched routes, so the limiter covers
+  // /api/status, 404s and every future route. It is registered before the
+  // routes so it also runs before the route-level authentication hook (429
+  // wins over 401).
+  fastify.addHook("onRequest", rateLimitHook);
 
   // onRequest runs before body parsing, so an unauthenticated body is never
   // read. Rate limiting is registered first and therefore still wins (429).
@@ -433,7 +511,7 @@ export function registerRoutes(fastify: FastifyInstance, config: Config): void {
 
   fastify.post(
     "/",
-    { onRequest: [rateLimitHook, authHook] },
+    { onRequest: [authHook] },
     async (request, reply) => {
       let attributesTruncated = false;
       const markAttributeTruncated = (): void => {
@@ -450,7 +528,7 @@ export function registerRoutes(fastify: FastifyInstance, config: Config): void {
           request,
           400,
           "invalid_payload",
-          `excerpt=${truncate(sanitizeForConsole(payloadExcerpt(request.body)), MAX_EXCERPT_LENGTH)}`,
+          describeRequestBody(request.body),
         );
         reply.status(400).send({ error: "Bad Request" });
         return;
@@ -603,7 +681,9 @@ export function registerRoutes(fastify: FastifyInstance, config: Config): void {
   });
 
   fastify.setNotFoundHandler((request, reply) => {
-    recordRejection(request, 404, "bad_request");
+    // Unknown routes are noise while being scanned: log the sampled first
+    // occurrence at INFO and keep the exact count in rejected_events_total.
+    recordRejection(request, 404, "bad_request", undefined, "info");
     reply.status(404).send({
       message: `Route ${request.method}:${request.url} not found`,
       error: "Not Found",

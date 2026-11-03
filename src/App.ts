@@ -7,6 +7,7 @@ import Fastify, {
 import { Config } from "./Config";
 import { registerRoutes } from "./AppRoutes";
 import { resolveRateLimitPerMinute } from "./RateLimiter";
+import { resolveTrustProxy } from "./TrustProxy";
 import {
   OTelLogger,
   OTelMeter,
@@ -146,24 +147,42 @@ export async function start(options?: AppOptions): Promise<FastifyInstance> {
   );
   if (rateLimitPerMinute === 0) {
     logger.info(
-      "webhook rate limiting disabled (WEBHOOK_RATE_LIMIT_PER_MINUTE=0)",
+      "rate limiting disabled (WEBHOOK_RATE_LIMIT_PER_MINUTE=0)",
     );
   } else {
     logger.info(
-      `webhook rate limit: ${rateLimitPerMinute} requests/minute per client IP`,
+      `rate limit: ${rateLimitPerMinute} requests/minute per client IP on every route`,
     );
   }
 
-  const fastify = Fastify(FASTIFY_OPTIONS);
+  const trustProxy = resolveTrustProxy(config.TRUST_PROXY);
+  if (trustProxy === true) {
+    logger.warn(
+      "client IP model: TRUST_PROXY=true trusts every X-Forwarded-For value; a header-sanitizing proxy is mandatory or clients can bypass the rate limiter",
+    );
+  } else if (trustProxy === false) {
+    logger.info(
+      "client IP model: TRUST_PROXY is off; request.ip is the direct peer address, so clients behind a proxy share its rate-limit bucket",
+    );
+  } else {
+    logger.info(
+      `client IP model: trusting X-Forwarded-For from ${trustProxy.length} configured proxy address range(s)`,
+    );
+  }
+
+  const fastify = Fastify({ ...FASTIFY_OPTIONS, trustProxy });
+
+  // Routes are registered before the tracing hooks so the global rate limiter
+  // runs first: a 429 short-circuits before a span or body parse.
+  registerRoutes(fastify, config);
 
   // rootApiPath "/" is required so webhook requests to POST / are traced:
   // the hooks default to "/api" and silently skip everything outside it.
   StandardTracerFastifyRegisterHooks(fastify, OTelTracer(), OTelLogger(), {
     rootApiPath: "/",
     ignoreList: ["GET-/api/status"],
+    unmatchedRouteSpanName: "method",
   });
-
-  registerRoutes(fastify, config);
 
   await fastify.listen({ port: config.API_PORT, host: "0.0.0.0" });
   logger.info("API Listening");

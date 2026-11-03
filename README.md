@@ -87,16 +87,29 @@ Each rejected request is counted exactly once in `rejected_events_total{reason}`
 | 429       | `rate_limited`          | Rate limit exceeded (see below)                                           |
 | other 4xx | `bad_request`           | Any other client error                                                    |
 
-Every rejection logs one WARN line: `Webhook request rejected: route=… status=… reason=…`. `invalid_payload` adds a sanitized excerpt of at most 200 characters; `invalid_json` deliberately logs no body. Console rendering strips ANSI escape sequences and control characters so an event cannot forge log lines; the OTel record keeps the raw values.
+Rejection **logs are sampled; the metric is exact.** `rejected_events_total` increments once per rejected request (a `WeakSet` prevents double counting), so counting and alerting on rejections is unaffected. The log line `Webhook request rejected: route=… status=… reason=…` is emitted at most once per sampling key per rolling 60 s window, where the key is the HTTP method (unknown methods collapse to `OTHER`), the registered route template (`unmatched` for unknown routes), the status and the reason. Later events in the window are counted as suppressed and reported on the next line as `suppressed=<n>`. This bounds log, trace and metric volume during a flood.
+
+- Unknown routes (404) log the sampled line at **INFO**, not WARN.
+- The logged route is the method and path with the query string removed, sanitized and truncated to 120 characters, so credentials in a query string are never logged.
+- `invalid_payload` logs the body **structure and types only** (`body_type=object key_count=2 has_message=true message_type=string`, or `body_type=null|array|string|…`): never key names, excerpts or values, because a rejected body can contain credentials. `invalid_json` deliberately logs no body.
+- Console rendering strips ANSI escape sequences and control characters so an event cannot forge log lines; the OTel record keeps the raw values.
 
 Server errors (5xx) are logged at ERROR and are **not** counted as rejections. A 5xx response always carries a fixed generic body (`{"statusCode": <code>, "error": "Internal Server Error"}`); the error message and code stay in the server logs, never in the response. Informative 4xx bodies are unchanged.
 
 Rate limiting and authentication both run in the Fastify `onRequest` phase, before the body is parsed:
 
-- `WEBHOOK_RATE_LIMIT_PER_MINUTE` defaults to **600**; `0` disables the limiter.
-- Fixed 60 s window; at most 10 000 clients are tracked.
-- A rejected request gets `429` with a `Retry-After` header and counts as `rate_limited`.
-- Fastify `trustProxy` is off, so behind an ingress every request shares the ingress pod's bucket.
+- The limiter is a **root `onRequest` hook**, so it covers every route, including `/api/status`, unknown routes (404) and any future route; a flood is rejected with `429` before tracing or body parsing.
+- `WEBHOOK_RATE_LIMIT_PER_MINUTE` defaults to **600** per client IP; `0` disables the limiter. A rejected request gets `429` with a `Retry-After` header and counts as `rate_limited`; it wins over `401` on `POST /`.
+- The bucket key is the resolved client IP (`request.ip` when it is a valid IP, otherwise the socket address, otherwise `unknown`). It is **never** the authorization token: that token is shared by every Flux event, so keying on it would create one global bucket.
+- `TRUST_PROXY` controls how the client IP is derived (see [Configuration](#configuration) and [Securing the webhook endpoint](#securing-the-webhook-endpoint)).
+
+Limiter properties to account for when sizing it (a documented trade-off, not a guarantee):
+
+- The fixed 60 s window is anchored to each client's first request, not to wall-clock minutes: a client can spend the full limit late in one window and the full limit again right after the boundary, so up to **2× the limit** can pass across a boundary.
+- On overflow (more than 10 000 tracked clients) the limiter scans the whole map, purges expired windows, then evicts the oldest window; eviction resets that client's counter. The cap bounds memory, it is not a hard global limit.
+- There is **no global cap**: worst-case admitted traffic is approximately tracked clients × limit per minute, so also rate-limit at the ingress.
+
+`otel-utils-fastify` logs client errors (`statusCode < 500`) once per request from its `onError` hook. A malformed JSON, oversized or unsupported body therefore produces a library WARN **plus** the adapter's own sampled record. This is bounded by the now-global limiter and by the log queue sizing; version 1.7.1 has no option to disable the library line, and the adapter's own record must not be silenced because it carries the rejection reason.
 
 ## Metrics
 
@@ -165,7 +178,7 @@ The adapter always prints `[info] [fluxcd-notifications] my-cluster: Reconciliat
 
 This adapter is meant to be deployed alongside your FluxCD installation in Kubernetes.
 
-The Kustomize base in [docs/deployments/kubernetes/kubernetes](docs/deployments/kubernetes/kubernetes) is the authoritative example; the [kubernetes-nodeport](docs/deployments/kubernetes/kubernetes-nodeport) overlay changes only the Service type. It deploys the image pinned to `0.10.0`, enables the logs collector and leaves the traces and metrics endpoints empty.
+The Kustomize base in [docs/deployments/kubernetes/kubernetes](docs/deployments/kubernetes/kubernetes) is the authoritative example; the [kubernetes-nodeport](docs/deployments/kubernetes/kubernetes-nodeport) overlay changes only the Service type. It deploys the image pinned to `0.11.0`, enables the logs collector and leaves the traces and metrics endpoints empty.
 
 ### Kustomize
 
@@ -210,7 +223,8 @@ data:
       "OPENTELEMETRY_COLLECTOR_HTTP_LOGS": "http://otel-light.otel-light.svc.cluster.local:8080/v1/logs",
       "OPENTELEMETRY_COLLECTOR_EXPORT_LOGS_INTERVAL_SECONDS": "60",
       "OPENTELEMETRY_COLLECTOR_EXPORT_METRICS_INTERVAL_SECONDS": "60",
-      "OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER": ""
+      "OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER": "",
+      "TRUST_PROXY": ""
     }
 ---
 # deployment.yaml
@@ -243,7 +257,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - image: devopsplaybookio/fluxcd-notifications-otel-adapter:0.10.0
+        - image: devopsplaybookio/fluxcd-notifications-otel-adapter:0.11.0
           name: fluxcd-notifications-otel-adapter
           securityContext:
             allowPrivilegeEscalation: false
@@ -314,7 +328,7 @@ spec:
 Notes:
 
 - Replace the `OPENTELEMETRY_COLLECTOR_HTTP_LOGS` URL with your collector. The example logs only; traces and metrics endpoints stay empty unless you need them.
-- Add `WEBHOOK_RATE_LIMIT_PER_MINUTE` (default `600`) or `WEBHOOK_AUTHORIZATION_HEADER` (default empty, authentication disabled) to the `config.json` key, or set them as environment variables on the container, to change the matching defaults.
+- Add `WEBHOOK_RATE_LIMIT_PER_MINUTE` (default `600`), `WEBHOOK_AUTHORIZATION_HEADER` (default empty, authentication disabled) or `TRUST_PROXY` (default empty) to the `config.json` key, or set them as environment variables on the container, to change the matching defaults.
 - Configuration is read once at startup and there is **no live reload**. After changing the ConfigMap or the environment, run `kubectl rollout restart deployment/fluxcd-notifications-otel-adapter`.
 - The ConfigMap is mounted with `subPath` because there is no live reload; that is also why ConfigMap updates are not picked up in place.
 - `GET /api/status` reports `{"started": true, "version": "<version>"}` and is used by the probes.
@@ -337,7 +351,8 @@ Configuration can be provided as environment variables or through `config.json`.
 | `OPENTELEMETRY_COLLECTOR_EXPORT_METRICS_INTERVAL_SECONDS` | Interval used to export metrics                                           | `60`                  | Config file or environment variable |
 | `OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER`            | Token sent to the collector as `Authorization: Bearer <value>`              | (empty)               | Config file or environment variable |
 | `WEBHOOK_AUTHORIZATION_HEADER`                          | Expected `Authorization` header on webhook events (sensitive)               | (empty)               | Config file or environment variable |
-| `WEBHOOK_RATE_LIMIT_PER_MINUTE`                         | Per-client-IP webhook rate limit; `0` disables the limiter                  | `600`                 | Config file or environment variable |
+| `WEBHOOK_RATE_LIMIT_PER_MINUTE`                         | Per-client-IP rate limit on every route; `0` disables the limiter           | `600`                 | Config file or environment variable |
+| `TRUST_PROXY`                                           | Client-IP model: empty/false (direct peer), `true`, or trusted proxy IPs/CIDRs | (empty)            | Config file or environment variable |
 
 `OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER` takes the token only; the adapter adds the `Bearer ` prefix.
 
@@ -352,8 +367,9 @@ Fixed limits (not configurable):
 - truncation counts code points, so it never splits a surrogate pair;
 - HTTP connection timeout 10 s, request timeout 15 s, keep-alive timeout 72 s;
 - graceful shutdown flush bound: 10 s;
-- rate-limit window: 60 s, at most 10 000 tracked clients;
-- log export: queue of 2 048 records, batch of 512, export timeout 30 s (worst case ~150 MiB queued, ~300 MiB during an export).
+- rate-limit window: 60 s, at most 10 000 tracked clients, fixed-window (up to 2× the limit across a boundary, no global cap);
+- rejection log sampling: first event per method/route-template/status/reason per rolling 60 s window, at most 256 tracked keys;
+- log queue: 2 048 records, batch of 512, export timeout 30 s (worst case ~150 MiB queued, ~300 MiB during an export). Malformed, oversized and unsupported bodies additionally produce one `otel-utils-fastify` client-error WARN per request.
 
 ## Securing the webhook endpoint
 
@@ -391,8 +407,28 @@ Recommended production posture:
 
 - enable the shared secret and rotate it periodically;
 - terminate TLS at an HTTPS ingress and restrict access with network policies — the adapter itself serves plain HTTP;
-- keep the in-process rate limiter as one layer; the `request.ip`/`trustProxy` caveat means all traffic behind an ingress shares the ingress pod's bucket, so also rate-limit at the ingress;
-- changing the header or the rate limit requires a restart (`kubectl rollout restart`).
+- keep the in-process rate limiter as one layer and also rate-limit at the ingress, because the in-process limiter has no global cap;
+- changing the header, the rate limit or `TRUST_PROXY` requires a restart (`kubectl rollout restart`).
+
+### Client IP model and ingress contract
+
+`TRUST_PROXY` is passed to Fastify `trustProxy` and decides what `request.ip` (and therefore the rate-limit bucket key) means:
+
+| `TRUST_PROXY`                              | `request.ip`                                               | Use when                                                                                          |
+| ------------------------------------------ | ---------------------------------------------------------- | ------------------------------------------------------------------------------------------------- |
+| empty / `false` / `no` / `off` / `0`       | the direct peer address                                    | default; clients connect directly (NetworkPolicy) or you rate-limit at the ingress instead         |
+| `true` / `yes` / `on`                      | the left-most `X-Forwarded-For` value, client-controlled    | never in production unless a proxy sanitizes and appends `X-Forwarded-For` to every request        |
+| `10.0.0.0/8, loopback` (IPs/CIDRs/keywords) | `X-Forwarded-For` only when the direct peer is trusted      | ingress pods reach the adapter from a known CIDR that also sanitizes/appends `X-Forwarded-For`     |
+
+Named keywords `loopback`, `linklocal` and `uniquelocal`, plain IPs and CIDR ranges are accepted, comma-separated. An invalid value fails startup with a clear error instead of failing per request.
+
+Behind an ingress every request can share the ingress pod IP when `TRUST_PROXY` is off, so one noisy client can exhaust the 600/min bucket and legitimate Flux webhooks are answered `429`. Choose one of:
+
+- set `TRUST_PROXY` to the ingress pod CIDR **only** if the ingress sanitizes/appends `X-Forwarded-For` and the adapter pods are not directly reachable (otherwise clients spoof the header and bypass the limiter);
+- disable the in-process limiter (`WEBHOOK_RATE_LIMIT_PER_MINUTE=0`) and rate-limit at the ingress;
+- raise the limit to the expected aggregate traffic when neither is possible.
+
+The limiter never keys on the authorization token: the token is shared by every Flux event, so one bucket would couple all clients.
 
 ## Operations
 
@@ -400,7 +436,7 @@ To verify the adapter is forwarding:
 
 - `kubectl logs -n fluxcd-notifications-otel-adapter deploy/fluxcd-notifications-otel-adapter` — each accepted event prints a `[level] [fluxcd-notifications] …` line;
 - query otel-light for the service name `fluxcd-notifications`, e.g. `GET /api/analytics/logs?serviceName=fluxcd-notifications&keywords=<cluster>`;
-- `GET /api/status` returns `{"started": true, "version": "0.10.0"}`.
+- `GET /api/status` returns `{"started": true, "version": "0.11.0"}`.
 
 Useful alerts:
 
