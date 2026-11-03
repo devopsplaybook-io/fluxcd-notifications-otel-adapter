@@ -291,6 +291,36 @@ describe("App lifecycle", () => {
     );
   });
 
+  it("should exit 1 when closing fastify fails during shutdown", async () => {
+    mockFastifyClose.mockRejectedValueOnce(new Error("close boom"));
+    const exit = jest.fn();
+    const { start, stop } = require("./App");
+    await start({ exit });
+
+    await stop({ exit });
+
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(mockAppLogger.error).toHaveBeenCalledWith(
+      "Error during shutdown",
+      expect.objectContaining({ message: "close boom" }),
+    );
+  });
+
+  it("should exit 1 when a telemetry flush fails during shutdown", async () => {
+    mockLoggerShutdown.mockRejectedValueOnce(new Error("flush boom"));
+    const exit = jest.fn();
+    const { start, stop } = require("./App");
+    await start({ exit });
+
+    await stop({ exit });
+
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(mockAppLogger.error).toHaveBeenCalledWith(
+      "Error during shutdown",
+      expect.objectContaining({ message: "flush boom" }),
+    );
+  });
+
   it("should exit 1 immediately on a second signal while shutting down", async () => {
     mockLoggerShutdown.mockReturnValue(new Promise(() => {}));
     const exit = jest.fn();

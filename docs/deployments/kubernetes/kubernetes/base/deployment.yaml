@@ -53,7 +53,7 @@ spec:
               memory: 500Mi
               cpu: 1
             requests:
-              memory: 20Mi
+              memory: 64Mi
               cpu: 100m
           volumeMounts:
             - name: config-volume

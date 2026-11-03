@@ -18,7 +18,7 @@ Delivery semantics:
 
 - **At-most-once from the adapter.** Events are not persisted, deduplicated or replayed. A crash, a restart or an exhausted shutdown bound loses buffered records.
 - **Batched, best-effort export.** Records sit in an in-memory queue of 2 048 entries. They are exported when 512 records accumulate or when `OPENTELEMETRY_COLLECTOR_EXPORT_LOGS_INTERVAL_SECONDS` elapses (default 60 s), whichever comes first. Each export attempt is bounded to 30 s. The OpenTelemetry SDK may retry a transient export failure, so a lost response can duplicate a batch even though the adapter emits each event once. A worst-case record is a 16 384-code-point message (up to ~64 KiB of UTF-16 data) plus ~10 KiB of 256-code-point attributes and record overhead (~75 KiB): a full queue can retain roughly 150 MiB, and an in-flight export can hold a second copy (~300 MiB).
-- **Bounded graceful shutdown.** On `SIGTERM` or `SIGINT` the adapter stops accepting requests, closes the HTTP server, then flushes logs, traces and metrics with a **10 s bound** and exits 0. A second signal during shutdown exits immediately with code 1. Records still buffered when the bound is reached are lost.
+- **Bounded graceful shutdown.** On `SIGTERM` or `SIGINT` the adapter stops accepting requests, then closes the HTTP server and flushes logs, traces and metrics under a **single 10 s bound**. It exits **1** when the close or any flush fails, and **0** on a clean shutdown or when the bound is reached (records still buffered then are lost). A second signal during shutdown exits immediately with code 1.
 - **Timestamp.** A valid RFC3339 `timestamp` between 2000-01-01 and one hour in the future is used as the record timestamp; otherwise the receipt time is used.
 
 ## Severity mapping
@@ -180,7 +180,7 @@ The adapter prints `[info] [fluxcd-notifications] my-cluster: ReconciliationSucc
 
 This adapter is meant to be deployed alongside your FluxCD installation in Kubernetes.
 
-The Kustomize base in [docs/deployments/kubernetes/kubernetes](docs/deployments/kubernetes/kubernetes) is the authoritative example; the [kubernetes-nodeport](docs/deployments/kubernetes/kubernetes-nodeport) overlay changes only the Service type. It deploys the image pinned to `0.13.0`, enables the logs collector, leaves the traces and metrics endpoints empty, requires the webhook Secret to be created before applying the manifests (`WEBHOOK_AUTH_REQUIRED=true`) and includes a NetworkPolicy (see [Securing the webhook endpoint](#securing-the-webhook-endpoint)).
+The Kustomize base in [docs/deployments/kubernetes/kubernetes](docs/deployments/kubernetes/kubernetes) is the authoritative example; the [kubernetes-nodeport](docs/deployments/kubernetes/kubernetes-nodeport) overlay changes only the Service type. It deploys the image pinned to `0.14.0`, enables the logs collector, leaves the traces and metrics endpoints empty, requires the webhook Secret to be created before applying the manifests (`WEBHOOK_AUTH_REQUIRED=true`) and includes a NetworkPolicy (see [Securing the webhook endpoint](#securing-the-webhook-endpoint)).
 
 ### Kustomize
 
@@ -269,7 +269,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - image: devopsplaybookio/fluxcd-notifications-otel-adapter:0.13.0
+        - image: devopsplaybookio/fluxcd-notifications-otel-adapter:0.14.0
           name: fluxcd-notifications-otel-adapter
           # Authorization headers are secrets: they must come from a Secret
           # (secretKeyRef), never from a ConfigMap or config.json.
@@ -296,7 +296,7 @@ spec:
               memory: 500Mi
               cpu: 1
             requests:
-              memory: 20Mi
+              memory: 64Mi
               cpu: 100m
           volumeMounts:
             - name: config-volume
@@ -424,7 +424,7 @@ Fixed limits (not configurable):
 - metric label values: 64 characters;
 - truncation counts code points, so it never splits a surrogate pair;
 - HTTP connection timeout 10 s, request timeout 15 s, keep-alive timeout 72 s;
-- graceful shutdown flush bound: 10 s;
+- graceful shutdown bound: 10 s over the HTTP server close plus the telemetry flush (exit 1 when either fails, 0 on a clean or timed-out shutdown);
 - rate-limit window: 60 s, at most 10 000 tracked clients, fixed-window (up to 2× the limit across a boundary, no global cap);
 - rejection log sampling: first event per method/route-template/status/reason per rolling 60 s window, at most 256 tracked keys;
 - log queue: 2 048 records, batch of 512, export timeout 30 s (worst case ~150 MiB queued, ~300 MiB during an export). Malformed, oversized and unsupported bodies additionally produce one `otel-utils-fastify` client-error WARN per request.
@@ -516,7 +516,7 @@ To verify the adapter is forwarding:
 
 - `kubectl logs -n fluxcd-notifications-otel-adapter deploy/fluxcd-notifications-otel-adapter` — each accepted event prints a `[level] [fluxcd-notifications] …` line unless `OPENTELEMETRY_CONSOLE_LOG_MODE` is `fallback` with a collector configured or `never`;
 - query otel-light for the service name `fluxcd-notifications`, e.g. `GET /api/analytics/logs?serviceName=fluxcd-notifications&keywords=<cluster>`;
-- `GET /api/status` returns `{"started": true, "version": "0.13.0"}`.
+- `GET /api/status` returns `{"started": true, "version": "0.14.0"}`.
 
 Useful alerts:
 

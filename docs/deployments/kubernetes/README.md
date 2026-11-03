@@ -1,6 +1,6 @@
 # Deploying with Kubernetes.
 
-In the [kubernetes](kubernetes) directory, you will find an example of deployment using Yaml files (with Kustomize). The service is a `ClusterIP` Service by default and the image is pinned to `0.13.0`.
+In the [kubernetes](kubernetes) directory, you will find an example of deployment using Yaml files (with Kustomize). The service is a `ClusterIP` Service by default and the image is pinned to `0.14.0`.
 
 The authorization headers are secrets and must come from a Kubernetes Secret (`secretKeyRef` in the Deployment), never from the ConfigMap or `config.json`. The example enables `WEBHOOK_AUTH_REQUIRED=true`: if the Secret is missing or its `WEBHOOK_AUTHORIZATION_HEADER` key is empty, the pod refuses to start instead of running unauthenticated.
 

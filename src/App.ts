@@ -69,20 +69,22 @@ async function performStop(options?: AppOptions): Promise<void> {
   const shutdownTimeoutMs =
     options?.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS;
 
+  let shutdownFailed = false;
   const shutdown = (async () => {
     if (fastifyInstance) {
       const instance = fastifyInstance;
       fastifyInstance = undefined;
       await instance.close();
     }
-    await Promise.allSettled([
+    await Promise.all([
       OTelLogger().shutdown(),
       OTelTracer()?.shutdown?.(),
       OTelMeter()?.shutdown?.(),
     ]);
   })().catch((error: unknown) => {
+    shutdownFailed = true;
     logger.error(
-      "Error while flushing telemetry",
+      "Error during shutdown",
       error instanceof Error ? error : new Error(String(error)),
     );
   });
@@ -103,12 +105,14 @@ async function performStop(options?: AppOptions): Promise<void> {
       clearTimeout(timer);
     }
   }
-  exit(0);
+  exit(shutdownFailed ? 1 : 0);
 }
 
 /**
- * Stops accepting requests, flushes the OTel providers with a bounded timeout
- * and exits. Idempotent: concurrent or repeated calls share one shutdown.
+ * Stops accepting requests, closes the HTTP server and flushes the OTel
+ * providers under one bounded timeout, then exits: 1 when the close or a
+ * flush fails, 0 on a clean shutdown or when the bound is reached.
+ * Idempotent: concurrent or repeated calls share one shutdown.
  */
 export async function stop(options?: AppOptions): Promise<void> {
   if (!stopPromise) {
