@@ -7,6 +7,9 @@
 node_modules/
 coverage
 /docs/dev/env.sh
+.env
+.env.*
+!.env.example
 .vscode
 /env-dev.js
 /dist

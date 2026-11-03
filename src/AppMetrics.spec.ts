@@ -49,6 +49,7 @@ function buildConfig(overrides: Partial<Config> = {}): Config {
   return {
     VERSION: "1.2.3",
     WEBHOOK_AUTHORIZATION_HEADER: "",
+    WEBHOOK_AUTH_REQUIRED: false,
     WEBHOOK_RATE_LIMIT_PER_MINUTE: 600,
     ...overrides,
   } as unknown as Config;

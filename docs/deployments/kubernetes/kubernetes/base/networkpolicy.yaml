@@ -1,0 +1,26 @@
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fluxcd-notifications-otel-adapter
+spec:
+  podSelector:
+    matchLabels:
+      app: fluxcd-notifications-otel-adapter
+  policyTypes:
+    - Ingress
+  ingress:
+    # Only the Flux notification-controller may reach the webhook port.
+    # Kubelet probe traffic from/to the pod's node is exempt from
+    # NetworkPolicy, so the /api/status probes keep working; NetworkPolicy
+    # cannot restrict by HTTP path. Adjust the namespace/pod labels if Flux
+    # is installed elsewhere.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: flux-system
+          podSelector:
+            matchLabels:
+              app: notification-controller
+      ports:
+        - protocol: TCP
+          port: 8080

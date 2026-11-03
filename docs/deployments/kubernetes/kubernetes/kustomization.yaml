@@ -7,7 +7,8 @@ resources:
   - base/service.yaml
   - base/rbac.yaml
   - base/configmap.yaml
+  - base/networkpolicy.yaml
 images:
   - name: fluxcd-notifications-otel-adapter
-    newTag: "0.11.0"
+    newTag: "0.12.0"
     newName: devopsplaybookio/fluxcd-notifications-otel-adapter

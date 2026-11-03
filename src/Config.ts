@@ -8,6 +8,10 @@ const { version: APP_VERSION } = require("../package.json");
 
 export class Config extends ConfigBase {
   public WEBHOOK_AUTHORIZATION_HEADER = "";
+  // When true, startup refuses to continue without WEBHOOK_AUTHORIZATION_HEADER
+  // (fail closed); when false (backward-compatible default), an empty header
+  // only logs a warning at startup.
+  public WEBHOOK_AUTH_REQUIRED = false;
   // Per-client-IP fixed window; 0 disables the in-process limiter.
   public WEBHOOK_RATE_LIMIT_PER_MINUTE = 600;
   // Fastify trustProxy: empty (direct peer), true (trust every X-Forwarded-For)
@@ -20,6 +24,7 @@ export class Config extends ConfigBase {
       field: "WEBHOOK_AUTHORIZATION_HEADER",
       sensitive: true,
     });
+    this.addConfigField({ field: "WEBHOOK_AUTH_REQUIRED" });
     this.addConfigField({ field: "WEBHOOK_RATE_LIMIT_PER_MINUTE" });
     this.addConfigField({ field: "TRUST_PROXY" });
     // ConfigBase defaults VERSION to the shared library's version; telemetry

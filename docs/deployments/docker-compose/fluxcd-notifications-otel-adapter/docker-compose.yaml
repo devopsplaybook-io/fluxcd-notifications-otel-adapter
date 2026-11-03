@@ -1,7 +1,7 @@
 # https://hub.docker.com/r/devopsplaybookio/fluxcd-notifications-otel-adapter
 services:
   fluxcd-notifications-otel-adapter:
-    image: devopsplaybookio/fluxcd-notifications-otel-adapter:0.11.0
+    image: devopsplaybookio/fluxcd-notifications-otel-adapter:0.12.0
     user: "1000:1000"
     read_only: true
     security_opt:
@@ -12,5 +12,12 @@ services:
       - /tmp
     ports:
       - "8080:8080"
+    # Authorization headers are secrets: export them in the shell or a
+    # git-ignored .env file, never in config.json or a committed file.
+    # The example config.json sets WEBHOOK_AUTH_REQUIRED=true, so the
+    # container refuses to start without the webhook secret.
+    environment:
+      WEBHOOK_AUTHORIZATION_HEADER: ${WEBHOOK_AUTHORIZATION_HEADER:?set_WEBHOOK_AUTHORIZATION_HEADER}
+      OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER: ${OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER:-}
     volumes:
       - ./config.json:/opt/app/config.json:ro

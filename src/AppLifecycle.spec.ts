@@ -52,6 +52,7 @@ const mockConfig = {
   API_PORT: 8080,
   VERSION: "0.7.0",
   WEBHOOK_AUTHORIZATION_HEADER: "",
+  WEBHOOK_AUTH_REQUIRED: false,
   WEBHOOK_RATE_LIMIT_PER_MINUTE: 600,
   TRUST_PROXY: "",
   reload: mockConfigReload,
@@ -92,6 +93,7 @@ beforeEach(() => {
   mockTracerShutdown.mockReset().mockResolvedValue(undefined);
   mockMeterShutdown.mockReset().mockResolvedValue(undefined);
   mockConfig.WEBHOOK_AUTHORIZATION_HEADER = "";
+  mockConfig.WEBHOOK_AUTH_REQUIRED = false;
   mockConfig.WEBHOOK_RATE_LIMIT_PER_MINUTE = 600;
   mockConfig.TRUST_PROXY = "";
   jest.resetModules();
@@ -203,6 +205,72 @@ describe("App lifecycle", () => {
     expect(mockAppLogger.error).toHaveBeenCalledWith(
       "Error starting fluxcd-notifications-otel-adapter",
       expect.any(Error),
+    );
+  });
+
+  it("should refuse to start when auth is required but the webhook header is empty", async () => {
+    mockConfig.WEBHOOK_AUTH_REQUIRED = true;
+    mockConfig.WEBHOOK_AUTHORIZATION_HEADER = "";
+    const exit = jest.fn();
+    const { main } = require("./App");
+
+    await main({ exit });
+
+    expect(exit).toHaveBeenCalledWith(1);
+    expect(mockFastifyListen).not.toHaveBeenCalled();
+    expect(mockAppLogger.error).toHaveBeenCalledWith(
+      "Error starting fluxcd-notifications-otel-adapter",
+      expect.objectContaining({
+        message: expect.stringContaining("WEBHOOK_AUTH_REQUIRED"),
+      }),
+    );
+    // The guard runs before any telemetry provider is built.
+    expect(mockStandardTracerCtor).not.toHaveBeenCalled();
+    expect(mockStandardMeterCtor).not.toHaveBeenCalled();
+    expect(mockOTelSetTracer).not.toHaveBeenCalled();
+    expect(mockOTelSetMeter).not.toHaveBeenCalled();
+    expect(mockStandardLogger.initOTel).not.toHaveBeenCalled();
+  });
+
+  it("should start and log the required mode when auth is required with a header", async () => {
+    mockConfig.WEBHOOK_AUTH_REQUIRED = true;
+    mockConfig.WEBHOOK_AUTHORIZATION_HEADER = "Bearer secret";
+    const { start } = require("./App");
+
+    await start();
+
+    expect(mockFastifyListen).toHaveBeenCalled();
+    expect(mockAppLogger.info).toHaveBeenCalledWith(
+      "webhook authentication required and enabled",
+    );
+    expect(mockAppLogger.warn).not.toHaveBeenCalledWith(
+      expect.stringContaining("webhook authentication disabled"),
+    );
+  });
+
+  it("should log enabled auth when a header is set without the fail-closed switch", async () => {
+    mockConfig.WEBHOOK_AUTH_REQUIRED = false;
+    mockConfig.WEBHOOK_AUTHORIZATION_HEADER = "Bearer secret";
+    const { start } = require("./App");
+
+    await start();
+
+    expect(mockFastifyListen).toHaveBeenCalled();
+    expect(mockAppLogger.info).toHaveBeenCalledWith(
+      "webhook authentication enabled (WEBHOOK_AUTH_REQUIRED=false)",
+    );
+  });
+
+  it("should keep starting with the fail-open warning when auth is not required and no header is set", async () => {
+    mockConfig.WEBHOOK_AUTH_REQUIRED = false;
+    mockConfig.WEBHOOK_AUTHORIZATION_HEADER = "";
+    const { start } = require("./App");
+
+    await start();
+
+    expect(mockFastifyListen).toHaveBeenCalled();
+    expect(mockAppLogger.warn).toHaveBeenCalledWith(
+      "webhook authentication disabled: WEBHOOK_AUTHORIZATION_HEADER is not set and WEBHOOK_AUTH_REQUIRED is false (backward-compatible fail-open)",
     );
   });
 
