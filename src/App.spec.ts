@@ -32,7 +32,7 @@ jest.mock("./Config", () => ({ Config: jest.fn() }));
 
 // swc hoists static imports above the mock declarations, so load the module
 // under test with an in-place require after jest.mock registration.
-const { registerRoutes } = require("./AppRoutes");
+const { registerRoutes, sanitizeForConsole, truncate } = require("./AppRoutes");
 const { FASTIFY_OPTIONS } = require("./App");
 
 import Fastify from "fastify";
@@ -69,6 +69,85 @@ function fullFluxPayload(): FluxEventPayload {
     },
   };
 }
+
+describe("sanitizeForConsole", () => {
+  it("removes an OSC sequence terminated by BEL", () => {
+    expect(sanitizeForConsole("a\u001b]0;title\u0007b")).toBe("ab");
+  });
+
+  it("removes an OSC sequence terminated by ESC backslash", () => {
+    expect(sanitizeForConsole("a\u001b]8;;url\u001b\\b")).toBe("ab");
+  });
+
+  it("drops an unterminated OSC through the end of the string", () => {
+    expect(sanitizeForConsole("\u001b]unterminated")).toBe("");
+  });
+
+  it("removes a complete CSI sequence", () => {
+    expect(sanitizeForConsole("a\u001b[31mred\u001b[0m")).toBe("ared");
+  });
+
+  it("removes a CSI sequence with intermediates", () => {
+    expect(sanitizeForConsole("a\u001b[1 qb")).toBe("ab");
+  });
+
+  it("keeps the payload after an incomplete CSI sequence", () => {
+    expect(sanitizeForConsole("a\u001b[1")).toBe("a1");
+  });
+
+  it("removes other two-character escapes", () => {
+    expect(sanitizeForConsole("a\u001bMb")).toBe("ab");
+  });
+
+  it("replaces a bare ESC that starts no escape sequence with a space", () => {
+    expect(sanitizeForConsole("a\u001bxb")).toBe("a xb");
+  });
+
+  it("replaces C0, DEL and C1 controls with spaces and keeps astral text", () => {
+    expect(sanitizeForConsole("a\u0000b\u007fc\u0085d")).toBe("a b c d");
+    expect(sanitizeForConsole("a😀b")).toBe("a😀b");
+  });
+
+  it("sanitizes a worst-case 16 KiB OSC-start payload in single-digit milliseconds", () => {
+    const payload = "\u001b]".repeat(8 * 1024);
+    expect(payload.length).toBe(16 * 1024);
+    sanitizeForConsole(payload); // warm up
+    const samples: number[] = [];
+    let result = "";
+    for (let i = 0; i < 5; i++) {
+      const start = performance.now();
+      result = sanitizeForConsole(payload);
+      samples.push(performance.now() - start);
+    }
+    expect(result).toBe("");
+    expect(Math.min(...samples)).toBeLessThan(10);
+  });
+});
+
+describe("truncate", () => {
+  it("leaves short strings unchanged", () => {
+    expect(truncate("short", 10)).toBe("short");
+  });
+
+  it("returns an empty string for a non-positive bound", () => {
+    expect(truncate("short", 0)).toBe("");
+    expect(truncate("short", -1)).toBe("");
+  });
+
+  it("counts Unicode code points so surrogate pairs are never split", () => {
+    const result = truncate("a" + "😀".repeat(10), 3);
+    expect(result).toBe("a😀😀");
+    expect(Array.from(result)).toHaveLength(3);
+    const last = result.charCodeAt(result.length - 1);
+    expect(last >= 0xd800 && last <= 0xdbff).toBe(false);
+  });
+
+  it("leaves a string whose code-point length equals the cap unchanged", () => {
+    const value = "😀".repeat(5);
+    expect(value.length).toBe(10);
+    expect(truncate(value, 5)).toBe(value);
+  });
+});
 
 describe("App API routes", () => {
   let fastify: ReturnType<typeof Fastify>;
@@ -466,6 +545,7 @@ describe("App API routes", () => {
       const truncatedCluster = "c".repeat(256);
       expect(record.attributes["flux.reason"]).toBe(truncatedReason);
       expect(record.attributes["flux.cluster"]).toBe(truncatedCluster);
+      expect(record.attributes["flux.attributes.truncated"]).toBe(true);
       expect(record.body).toBe(
         `${truncatedCluster}: ${truncatedReason} - Deployment applied`,
       );
@@ -473,6 +553,187 @@ describe("App API routes", () => {
         cluster: "c".repeat(64),
         reason: "r".repeat(64),
         severity: "unknown",
+      });
+    });
+
+    describe("non-string severity", () => {
+      it.each([
+        ["a number", 42],
+        ["a boolean", true],
+        ["an object", { level: "error" }],
+        ["an array", ["error"]],
+        ["null", null],
+      ])("accepts %s as unknown without a 5xx", async (_label, severity) => {
+        const response = await postEvent({ message: "ok", severity });
+
+        expect(response.statusCode).toBe(200);
+        const record = mockRawEmit.mock.calls[0][0];
+        expect(record.severityNumber).toBe(SeverityNumber.INFO);
+        expect(record.severityText).toBe("INFO");
+        expect(record.attributes["flux.severity"]).toBe("unknown");
+        expect(mockEventsCounter.add).toHaveBeenCalledWith(1, {
+          cluster: "unknown",
+          reason: "unknown",
+          severity: "unknown",
+        });
+        expect(mockRejectedEventsCounter.add).not.toHaveBeenCalled();
+      });
+    });
+
+    describe("bounded input-derived attributes", () => {
+      it("caps every input-derived attribute at 256 code points and flags truncation", async () => {
+        const response = await postEvent({
+          message: "Deployment applied",
+          reason: "r".repeat(400),
+          severity: "S".repeat(400),
+          reportingController: "c".repeat(400),
+          involvedObject: {
+            kind: "k".repeat(400),
+            name: "n".repeat(400),
+            namespace: "s".repeat(400),
+            apiVersion: "a".repeat(400),
+            uid: "u".repeat(400),
+          },
+          metadata: {
+            cluster: "C".repeat(400),
+            "kustomize.toolkit.fluxcd.io/revision": "v".repeat(400),
+          },
+        });
+
+        expect(response.statusCode).toBe(200);
+        const record = mockRawEmit.mock.calls[0][0];
+        const attributes = record.attributes as Record<string, string | boolean>;
+        for (const key of [
+          "flux.cluster",
+          "flux.reason",
+          "flux.severity",
+          "flux.object.kind",
+          "flux.object.name",
+          "flux.object.namespace",
+          "flux.object.apiVersion",
+          "flux.object.uid",
+          "flux.revision",
+          "flux.reporting_controller",
+        ]) {
+          expect(Array.from(attributes[key] as string)).toHaveLength(256);
+        }
+        expect(attributes["flux.severity"]).toBe("s".repeat(256));
+        expect(attributes["flux.attributes.truncated"]).toBe(true);
+        expect(mockEventsCounter.add).toHaveBeenCalledTimes(1);
+      });
+
+      it("counts code points so an astral attribute never ends in a lone surrogate", async () => {
+        const response = await postEvent({
+          message: "ok",
+          involvedObject: { kind: "😀".repeat(300) },
+        });
+
+        expect(response.statusCode).toBe(200);
+        const attributes = mockRawEmit.mock.calls[0][0].attributes as Record<
+          string,
+          string | boolean
+        >;
+        const kind = attributes["flux.object.kind"] as string;
+        expect(Array.from(kind)).toHaveLength(256);
+        expect(kind.length).toBe(512);
+        const last = kind.charCodeAt(kind.length - 1);
+        expect(last >= 0xd800 && last <= 0xdbff).toBe(false);
+        expect(attributes["flux.attributes.truncated"]).toBe(true);
+      });
+
+      it("does not flag a 256-code-point attribute as truncated", async () => {
+        await postEvent({
+          message: "ok",
+          reason: "r".repeat(256),
+          involvedObject: { kind: "k".repeat(256) },
+        });
+
+        const attributes = mockRawEmit.mock.calls[0][0].attributes as Record<
+          string,
+          string | boolean
+        >;
+        expect(attributes["flux.reason"]).toBe("r".repeat(256));
+        expect(attributes["flux.object.kind"]).toBe("k".repeat(256));
+        expect(attributes["flux.attributes.truncated"]).toBeUndefined();
+      });
+
+      it("omits non-string and empty object fields instead of stringifying them", async () => {
+        await postEvent({
+          message: "ok",
+          reportingController: 42,
+          involvedObject: {
+            kind: 42,
+            name: true,
+            namespace: {},
+            uid: "",
+          },
+        });
+
+        const attributes = mockRawEmit.mock.calls[0][0].attributes as Record<
+          string,
+          string | boolean
+        >;
+        for (const key of [
+          "flux.object.kind",
+          "flux.object.name",
+          "flux.object.namespace",
+          "flux.object.uid",
+          "flux.reporting_controller",
+        ]) {
+          expect(attributes).not.toHaveProperty(key);
+        }
+        expect(attributes["flux.attributes.truncated"]).toBeUndefined();
+      });
+    });
+
+    describe("generic 5xx bodies", () => {
+      it("never leaks an internal error message or code for a 5xx", async () => {
+        fastify.get("/internal", async () => {
+          const error = new Error("internal-secret") as Error & {
+            statusCode: number;
+            code: string;
+          };
+          error.statusCode = 500;
+          error.code = "E_INTERNAL";
+          throw error;
+        });
+
+        const response = await fastify.inject({ method: "GET", url: "/internal" });
+
+        expect(response.statusCode).toBe(500);
+        expect(response.json()).toEqual({
+          statusCode: 500,
+          error: "Internal Server Error",
+        });
+        expect(response.body).not.toContain("internal-secret");
+        expect(response.body).not.toContain("E_INTERNAL");
+        expect(mockModuleLogger.error).toHaveBeenCalledTimes(1);
+        const logged = mockModuleLogger.error.mock.calls[0][0] as string;
+        expect(logged).toContain("internal-secret");
+        expect(logged).toContain("E_INTERNAL");
+        expect(mockRejectedEventsCounter.add).not.toHaveBeenCalled();
+      });
+
+      it("applies error headers and keeps an informative 4xx body", async () => {
+        fastify.get("/teapot", async () => {
+          const error = new Error("teapot-brewing") as Error & {
+            statusCode: number;
+            headers: Record<string, string>;
+          };
+          error.statusCode = 418;
+          error.headers = { "x-error-hint": "short-and-stout" };
+          throw error;
+        });
+
+        const response = await fastify.inject({ method: "GET", url: "/teapot" });
+
+        expect(response.statusCode).toBe(418);
+        expect(response.headers["x-error-hint"]).toBe("short-and-stout");
+        expect(response.json().message).toContain("teapot-brewing");
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledTimes(1);
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
+          reason: "bad_request",
+        });
       });
     });
 
@@ -675,6 +936,42 @@ describe("App API routes", () => {
 
         expect(response.statusCode).toBe(401);
         expect(response.headers["www-authenticate"]).toBe("Bearer");
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledTimes(1);
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
+          reason: "unauthorized",
+        });
+      });
+
+      it("should reject a malformed JSON body before parsing it", async () => {
+        const response = await fastify.inject({
+          method: "POST",
+          url: "/",
+          headers: { "content-type": "application/json" },
+          payload: '{"message": "secret-body-text"',
+        });
+
+        expect(response.statusCode).toBe(401);
+        expect(response.json()).toEqual({ error: "Unauthorized" });
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledTimes(1);
+        expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
+          reason: "unauthorized",
+        });
+        expect(mockModuleLogger.warn).toHaveBeenCalledTimes(1);
+      });
+
+      it("should reject an oversized body before reading it", async () => {
+        const response = await fastify.inject({
+          method: "POST",
+          url: "/",
+          headers: {
+            "content-type": "text/plain",
+            authorization: "Bearer wrong",
+          },
+          payload: "x".repeat(64 * 1024 + 1),
+        });
+
+        expect(response.statusCode).toBe(401);
+        expect(response.json()).toEqual({ error: "Unauthorized" });
         expect(mockRejectedEventsCounter.add).toHaveBeenCalledTimes(1);
         expect(mockRejectedEventsCounter.add).toHaveBeenCalledWith(1, {
           reason: "unauthorized",

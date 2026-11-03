@@ -238,4 +238,25 @@ describe("rejection metrics (in-memory reader)", () => {
     expect(points[0].value).toBe(1);
     expect(await dataPoints(REJECTED_METRIC)).toHaveLength(0);
   });
+
+  it("counts a non-string severity as an accepted unknown event", async () => {
+    setup();
+
+    const response = await fastify!.inject({
+      method: "POST",
+      url: "/",
+      payload: { message: "ok", severity: 42 },
+    });
+
+    expect(response.statusCode).toBe(200);
+    const points = await dataPoints(EVENTS_METRIC);
+    expect(points).toHaveLength(1);
+    expect(points[0].attributes).toEqual({
+      cluster: "unknown",
+      reason: "unknown",
+      severity: "unknown",
+    });
+    expect(points[0].value).toBe(1);
+    expect(await dataPoints(REJECTED_METRIC)).toHaveLength(0);
+  });
 });

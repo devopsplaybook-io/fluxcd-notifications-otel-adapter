@@ -1,6 +1,6 @@
 # Deploying with Kubernetes.
 
-In the [kubernetes](kubernetes) directory, you will find an example of deployment using Yaml files (with Kustomize). The service is a `ClusterIP` Service by default and the image is pinned to `0.9.0`.
+In the [kubernetes](kubernetes) directory, you will find an example of deployment using Yaml files (with Kustomize). The service is a `ClusterIP` Service by default and the image is pinned to `0.10.0`.
 
 To launch the application in Kubernetes with the default configuration:
 

@@ -17,7 +17,7 @@ With no logs endpoint configured, no record is exported: the same line is printe
 Delivery semantics:
 
 - **At-most-once from the adapter.** Events are not persisted, deduplicated or replayed. A crash, a restart or an exhausted shutdown bound loses buffered records.
-- **Batched, best-effort export.** Records sit in an in-memory queue of 2 048 entries. They are exported when 512 records accumulate or when `OPENTELEMETRY_COLLECTOR_EXPORT_LOGS_INTERVAL_SECONDS` elapses (default 60 s), whichever comes first. Each export attempt is bounded to 30 s. The OpenTelemetry SDK may retry a transient export failure, so a lost response can duplicate a batch even though the adapter emits each event once.
+- **Batched, best-effort export.** Records sit in an in-memory queue of 2 048 entries. They are exported when 512 records accumulate or when `OPENTELEMETRY_COLLECTOR_EXPORT_LOGS_INTERVAL_SECONDS` elapses (default 60 s), whichever comes first. Each export attempt is bounded to 30 s. The OpenTelemetry SDK may retry a transient export failure, so a lost response can duplicate a batch even though the adapter emits each event once. A worst-case record is a 16 384-code-point message (up to ~64 KiB of UTF-16 data) plus ~10 KiB of 256-code-point attributes and record overhead (~75 KiB): a full queue can retain roughly 150 MiB, and an in-flight export can hold a second copy (~300 MiB).
 - **Bounded graceful shutdown.** On `SIGTERM` or `SIGINT` the adapter stops accepting requests, closes the HTTP server, then flushes logs, traces and metrics with a **10 s bound** and exits 0. A second signal during shutdown exits immediately with code 1. Records still buffered when the bound is reached are lost.
 - **Timestamp.** A valid RFC3339 `timestamp` between 2000-01-01 and one hour in the future is used as the record timestamp; otherwise the receipt time is used.
 
@@ -32,8 +32,9 @@ The raw event severity is mapped to the OTel severity, kept on the log record, a
 | `warn` / `warning`         | WARN          | `warn`                        | `warn`                  |
 | absent                     | INFO          | `unknown`                     | `unknown`               |
 | any other, e.g. `critical` | INFO          | `critical`                    | `unknown`               |
+| a non-string, e.g. `42`    | INFO          | `unknown`                     | `unknown`               |
 
-`flux.severity` holds the trimmed, lower-cased raw value (or `unknown` when absent) and is **not** limited to four values. Only the metric label is normalized to `info`, `warn`, `error` or `unknown`.
+`flux.severity` holds the trimmed, lower-cased raw value (or `unknown` when absent) and is **not** limited to four values. A non-string value is treated as absent (`unknown`) instead of failing the request. Only the metric label is normalized to `info`, `warn`, `error` or `unknown`.
 
 ## Log record body and attributes
 
@@ -41,18 +42,21 @@ The record body is `<cluster>: <reason> - <message>`. Structured attributes:
 
 | Attribute                   | Description                                                                                              |
 | --------------------------- | -------------------------------------------------------------------------------------------------------- |
-| `flux.cluster`              | Cluster name from `metadata.cluster`; `unknown` when absent; truncated to 256 characters                  |
-| `flux.reason`               | Event reason; `unknown` when absent; truncated to 256 characters                                          |
-| `flux.severity`             | Trimmed, lower-cased raw severity; `unknown` when absent — not normalized to four values                  |
-| `flux.object.kind`          | `involvedObject.kind` of the affected resource, when present                                               |
-| `flux.object.name`          | `involvedObject.name` of the affected resource, when present                                               |
-| `flux.object.namespace`     | `involvedObject.namespace` of the affected resource, when present                                          |
-| `flux.object.apiVersion`    | `involvedObject.apiVersion` of the affected resource, when present                                         |
-| `flux.object.uid`           | `involvedObject.uid` of the affected resource, when present                                                |
-| `flux.revision`             | Artifact revision from the `…/revision` metadata keys, when present                                        |
-| `flux.reporting_controller` | `reportingController` of the emitting Flux controller, when present                                        |
-| `flux.message.truncated`    | `true` only when the message exceeded 16 KiB and was truncated                                             |
+| `flux.cluster`              | Cluster name from `metadata.cluster`; `unknown` when absent; truncated to 256 code points                 |
+| `flux.reason`               | Event reason; `unknown` when absent; truncated to 256 code points                                         |
+| `flux.severity`             | Trimmed, lower-cased raw severity; `unknown` when absent; truncated to 256 code points                    |
+| `flux.object.kind`          | `involvedObject.kind` of the affected resource, when present; truncated to 256 code points                 |
+| `flux.object.name`          | `involvedObject.name` of the affected resource, when present; truncated to 256 code points                 |
+| `flux.object.namespace`     | `involvedObject.namespace` of the affected resource, when present; truncated to 256 code points            |
+| `flux.object.apiVersion`    | `involvedObject.apiVersion` of the affected resource, when present; truncated to 256 code points           |
+| `flux.object.uid`           | `involvedObject.uid` of the affected resource, when present; truncated to 256 code points                  |
+| `flux.revision`             | Artifact revision from the `…/revision` metadata keys, when present; truncated to 256 code points          |
+| `flux.reporting_controller` | `reportingController` of the emitting Flux controller, when present; truncated to 256 code points           |
+| `flux.message.truncated`    | `true` only when the message exceeded 16 384 code points and was truncated                                  |
+| `flux.attributes.truncated` | `true` only when a non-message input attribute was truncated to 256 code points                             |
 | `trace.id` / `span.id`      | Request trace/span correlation attributes added when a logs endpoint is configured                         |
+
+Every input-derived string attribute is capped at 256 code points; truncation never splits a surrogate pair. Truncation of a non-message attribute sets `flux.attributes.truncated=true`.
 
 When metadata carries several `…/revision` keys, the kustomize, helm, source then notification revision is used, in that order, followed by the alphabetically first remaining key.
 
@@ -66,7 +70,7 @@ Only `message` is mandatory: it must be a non-empty string after trimming. `reas
 - `involvedObject.{kind,name,namespace,apiVersion,uid}`
 - `metadata` (including `metadata.cluster` and the `…/revision` keys)
 
-Limits: `message` is truncated at 16 KiB (with `flux.message.truncated=true`); `reason` and `cluster` are truncated at 256 characters.
+Limits: `message` is truncated at 16 384 code points (16 KiB, up to ~64 KiB of UTF-16 data) with `flux.message.truncated=true`; every other input-derived string attribute (`reason`, `cluster`, `severity`, `involvedObject.*`, `revision`, `reportingController`) is truncated at 256 code points with `flux.attributes.truncated=true`. Truncation counts Unicode code points, so it never splits a surrogate pair.
 
 ## Rejected requests
 
@@ -85,9 +89,9 @@ Each rejected request is counted exactly once in `rejected_events_total{reason}`
 
 Every rejection logs one WARN line: `Webhook request rejected: route=… status=… reason=…`. `invalid_payload` adds a sanitized excerpt of at most 200 characters; `invalid_json` deliberately logs no body. Console rendering strips ANSI escape sequences and control characters so an event cannot forge log lines; the OTel record keeps the raw values.
 
-Server errors (5xx) are logged at ERROR and are **not** counted as rejections.
+Server errors (5xx) are logged at ERROR and are **not** counted as rejections. A 5xx response always carries a fixed generic body (`{"statusCode": <code>, "error": "Internal Server Error"}`); the error message and code stay in the server logs, never in the response. Informative 4xx bodies are unchanged.
 
-Rate limiting is enforced per client IP before body parsing:
+Rate limiting and authentication both run in the Fastify `onRequest` phase, before the body is parsed:
 
 - `WEBHOOK_RATE_LIMIT_PER_MINUTE` defaults to **600**; `0` disables the limiter.
 - Fixed 60 s window; at most 10 000 clients are tracked.
@@ -161,7 +165,7 @@ The adapter always prints `[info] [fluxcd-notifications] my-cluster: Reconciliat
 
 This adapter is meant to be deployed alongside your FluxCD installation in Kubernetes.
 
-The Kustomize base in [docs/deployments/kubernetes/kubernetes](docs/deployments/kubernetes/kubernetes) is the authoritative example; the [kubernetes-nodeport](docs/deployments/kubernetes/kubernetes-nodeport) overlay changes only the Service type. It deploys the image pinned to `0.9.0`, enables the logs collector and leaves the traces and metrics endpoints empty.
+The Kustomize base in [docs/deployments/kubernetes/kubernetes](docs/deployments/kubernetes/kubernetes) is the authoritative example; the [kubernetes-nodeport](docs/deployments/kubernetes/kubernetes-nodeport) overlay changes only the Service type. It deploys the image pinned to `0.10.0`, enables the logs collector and leaves the traces and metrics endpoints empty.
 
 ### Kustomize
 
@@ -239,7 +243,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - image: devopsplaybookio/fluxcd-notifications-otel-adapter:0.9.0
+        - image: devopsplaybookio/fluxcd-notifications-otel-adapter:0.10.0
           name: fluxcd-notifications-otel-adapter
           securityContext:
             allowPrivilegeEscalation: false
@@ -342,19 +346,20 @@ Sensitive values are masked as `********************` in the configuration log o
 Fixed limits (not configurable):
 
 - request body: 64 KiB (larger bodies are rejected with 413);
-- message: 16 KiB (truncated, with `flux.message.truncated=true`);
-- reason and cluster: 256 characters (truncated);
+- message: 16 384 code points (16 KiB, up to ~64 KiB of UTF-16 data; truncated, with `flux.message.truncated=true`);
+- every other input-derived string attribute: 256 code points (truncated, with `flux.attributes.truncated=true`);
 - metric label values: 64 characters;
+- truncation counts code points, so it never splits a surrogate pair;
 - HTTP connection timeout 10 s, request timeout 15 s, keep-alive timeout 72 s;
 - graceful shutdown flush bound: 10 s;
 - rate-limit window: 60 s, at most 10 000 tracked clients;
-- log export: queue of 2 048 records, batch of 512, export timeout 30 s.
+- log export: queue of 2 048 records, batch of 512, export timeout 30 s (worst case ~150 MiB queued, ~300 MiB during an export).
 
 ## Securing the webhook endpoint
 
 Authentication is **fail-open by default**: when `WEBHOOK_AUTHORIZATION_HEADER` is empty, any request is accepted. The adapter logs a startup warning (`webhook authentication disabled: WEBHOOK_AUTHORIZATION_HEADER is not set`) so the disabled state is visible.
 
-When `WEBHOOK_AUTHORIZATION_HEADER` is set, `POST /` requires the exact same `Authorization` header (timing-safe comparison). A missing or wrong header gets `401` with `WWW-Authenticate: Bearer` and counts as `rejected_events_total{reason="unauthorized"}`.
+When `WEBHOOK_AUTHORIZATION_HEADER` is set, `POST /` requires the exact same `Authorization` header (timing-safe comparison). A missing or wrong header gets `401` with `WWW-Authenticate: Bearer` and counts as `rejected_events_total{reason="unauthorized"}`. The check runs in the `onRequest` phase before body parsing, so an unauthenticated request with a malformed or oversized body still gets `401` rather than `400`/`413`.
 
 The Flux generic `Provider` adds HTTP headers from the `headers` key of its `secretRef` Secret, so a shared secret is configured like this:
 
@@ -395,7 +400,7 @@ To verify the adapter is forwarding:
 
 - `kubectl logs -n fluxcd-notifications-otel-adapter deploy/fluxcd-notifications-otel-adapter` — each accepted event prints a `[level] [fluxcd-notifications] …` line;
 - query otel-light for the service name `fluxcd-notifications`, e.g. `GET /api/analytics/logs?serviceName=fluxcd-notifications&keywords=<cluster>`;
-- `GET /api/status` returns `{"started": true, "version": "0.9.0"}`.
+- `GET /api/status` returns `{"started": true, "version": "0.10.0"}`.
 
 Useful alerts:
 

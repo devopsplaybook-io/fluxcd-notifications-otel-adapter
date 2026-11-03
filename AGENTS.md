@@ -63,25 +63,25 @@ The constructor also overrides `VERSION` with the application's `package.json` v
 ### Request Flow
 
 1. FluxCD sends a POST to `/` with the Kubernetes Event object (severity, message, reason, involvedObject, metadata, reportingController, timestamp)
-2. Rate limiting runs first, before body parsing and before authentication: `WEBHOOK_RATE_LIMIT_PER_MINUTE` per client IP in a fixed 60 s window (at most 10 000 tracked clients); over the limit → `429` + `Retry-After`, counted as `rate_limited`
-3. When `WEBHOOK_AUTHORIZATION_HEADER` is set, the request must carry the exact same `Authorization` header (timing-safe, `401` + `WWW-Authenticate: Bearer` otherwise)
+2. Rate limiting runs first in the Fastify `onRequest` phase, before body parsing and before authentication: `WEBHOOK_RATE_LIMIT_PER_MINUTE` per client IP in a fixed 60 s window (at most 10 000 tracked clients); over the limit → `429` + `Retry-After`, counted as `rate_limited`
+3. Authentication runs in the same `onRequest` phase, still before body parsing: when `WEBHOOK_AUTHORIZATION_HEADER` is set, the request must carry the exact same `Authorization` header (timing-safe, `401` + `WWW-Authenticate: Bearer` otherwise). An unauthenticated malformed or oversized body therefore gets `401`, not `400`/`413`
 4. Fastify rejects oversized bodies (`413`, 64 KiB limit) and unsupported content types (`415`) before the handler runs
-5. The handler requires only a non-empty `message`: a missing/blank message is `400 invalid_payload`. `reason` and `metadata.cluster` default to `unknown`
-6. Accepted events are emitted as one OTel log record via `StandardLogger.getLogger().emit()` when a logs endpoint is configured: severity mapped from the Flux severity (info→INFO, error→ERROR, warn/warning→WARN, else INFO), body `<cluster>: <reason> - <message>`, and `flux.*` attributes (cluster, reason, severity, object kind/name/namespace/apiVersion/uid, revision, reporting_controller, `flux.message.truncated` when applicable) with the request OTel context attached. A console line `[level] [fluxcd-notifications] <body>` is always printed; with no logs endpoint the event goes to the console only through the module logger
+5. The handler requires only a non-empty `message`: a missing/blank message is `400 invalid_payload`. `reason` and `metadata.cluster` default to `unknown`; a non-string `severity` is treated as absent (`unknown`) without failing the request
+6. Accepted events are emitted as one OTel log record via `StandardLogger.getLogger().emit()` when a logs endpoint is configured: severity mapped from the Flux severity (info→INFO, error→ERROR, warn/warning→WARN, else INFO), body `<cluster>: <reason> - <message>`, and `flux.*` attributes (cluster, reason, severity, object kind/name/namespace/apiVersion/uid, revision, reporting_controller, `flux.message.truncated`, `flux.attributes.truncated` when applicable) with the request OTel context attached. A console line `[level] [fluxcd-notifications] <body>` is always printed; with no logs endpoint the event goes to the console only through the module logger. Every input-derived string attribute is capped at 256 code points (code-point aware, never splitting a surrogate pair)
 7. Events are counted in `events_total{cluster, reason, severity}`; counters are only exported when a metrics endpoint is configured
 8. The response is `{"status":"ok"}`; a health check is available at `GET /api/status` → `{ started: true, version: "<version>" }`
 
-Rejection reasons counted exactly once in `rejected_events_total{reason}`: `invalid_payload` (400), `invalid_json` (400), `unauthorized` (401), `bad_request` (404 and other 4xx), `payload_too_large` (413), `unsupported_media_type` (415), `rate_limited` (429). Each rejection logs a WARN with route/status/reason; `invalid_payload` adds a sanitized ≤200-character excerpt, `invalid_json` deliberately logs no body. 5xx responses are logged at ERROR and are **not** counted as rejections.
+Rejection reasons counted exactly once in `rejected_events_total{reason}`: `invalid_payload` (400), `invalid_json` (400), `unauthorized` (401), `bad_request` (404 and other 4xx), `payload_too_large` (413), `unsupported_media_type` (415), `rate_limited` (429). Each rejection logs a WARN with route/status/reason; `invalid_payload` adds a sanitized ≤200-character excerpt, `invalid_json` deliberately logs no body. 5xx responses are logged at ERROR (with message and code) and are **not** counted as rejections; their response body is a fixed generic `{statusCode, error: "Internal Server Error"}`, never the thrown message/code.
 
 ### Severity
 
-`flux.severity` on the log record keeps the trimmed, lower-cased raw value (`unknown` when absent, arbitrary values such as `critical` preserved). Only the metric `severity` label is normalized to `info|warn|error|unknown`. Log severity: info→INFO, error→ERROR, warn/warning→WARN, anything else→INFO.
+`flux.severity` on the log record keeps the trimmed, lower-cased raw value (`unknown` when absent, arbitrary values such as `critical` preserved). A non-string value (number, boolean, object, array, null) is treated as absent, not rejected. Only the metric `severity` label is normalized to `info|warn|error|unknown`. Log severity: info→INFO, error→ERROR, warn/warning→WARN, anything else→INFO.
 
 ### Fastify Hooks and Limits
 
 `StandardTracerFastifyRegisterHooks` is registered with `rootApiPath: "/"` so webhook requests to `POST /` are traced (the default `/api` root silently skips them), and `ignoreList: ["GET-/api/status"]` to avoid tracing health checks.
 
-Fixed Fastify limits (`src/App.ts`): body 64 KiB, connection timeout 10 s, request timeout 15 s, keep-alive timeout 72 s. Shutdown flushes telemetry with a 10 s bound.
+Fixed Fastify limits (`src/App.ts`): body 64 KiB, connection timeout 10 s, request timeout 15 s, keep-alive timeout 72 s. Shutdown flushes telemetry with a 10 s bound. The log queue is 2 048 records; a worst-case record is ~75 KiB (16 384-code-point message up to ~64 KiB UTF-16 plus ~10 KiB of 256-code-point attributes), so a full queue can retain roughly 150 MiB and an in-flight export a second copy (~300 MiB).
 
 ### Graceful Shutdown
 
@@ -126,7 +126,7 @@ Project-specific configuration values:
 GitHub Actions workflows use reusable workflows from `devopsplaybook-io/common-utils`:
 
 - `pr-check.yml` — runs on PR to `main`: version check, `npm ci`, build, lint, test, coverage upload, audit gate (high/critical production advisories) and Docker build/push of `beta-pr-<n>` and `beta`
-- `main-build.yml` — runs on merge to `main`: audit and promotion of the exact PR-validated image to `0.9.0`, `0.9`, `0`, `latest` and `beta` (no rebuild)
+- `main-build.yml` — runs on merge to `main`: audit and promotion of the exact PR-validated image to `0.10.0`, `0.10`, `0`, `latest` and `beta` (no rebuild)
 
 ## Post-Change Validation
 
@@ -138,7 +138,7 @@ npm run lint     # oxlint check
 npm test         # Jest tests with coverage
 ```
 
-All three must pass. Jest enforces global coverage thresholds of 85% statements, 80% branches, 85% functions and 85% lines (`jest.config.js`). Current numbers on `main`: 105 tests, 96.56% statements/lines, 90.81% branches, 100% functions.
+All three must pass. Jest enforces global coverage thresholds of 85% statements, 80% branches, 85% functions and 85% lines (`jest.config.js`). Current numbers on `main`: 133 tests, 97.59% statements/lines, 93.61% branches, 100% functions.
 
 For changes touching deployment examples or documentation paths, also verify the Kustomize output still builds:
 
