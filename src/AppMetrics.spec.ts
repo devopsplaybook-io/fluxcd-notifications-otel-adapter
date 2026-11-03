@@ -218,6 +218,23 @@ describe("rejection metrics (in-memory reader)", () => {
     await expectRejectedOnce("bad_request");
   });
 
+  it("counts every 404 in a flood under log sampling", async () => {
+    setup({ WEBHOOK_RATE_LIMIT_PER_MINUTE: 0 });
+
+    for (let i = 0; i < 5; i++) {
+      const response = await fastify!.inject({
+        method: "GET",
+        url: `/nope-${i}`,
+      });
+      expect(response.statusCode).toBe(404);
+    }
+
+    const points = await dataPoints(REJECTED_METRIC);
+    expect(points).toHaveLength(1);
+    expect(points[0].attributes).toEqual({ reason: "bad_request" });
+    expect(points[0].value).toBe(5);
+  });
+
   it("counts an accepted event in events_total and not as a rejection", async () => {
     setup();
 

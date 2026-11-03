@@ -84,6 +84,11 @@ describe("Config", () => {
       expect(config.WEBHOOK_RATE_LIMIT_PER_MINUTE).toBe(600);
     });
 
+    it("should default TRUST_PROXY to an empty string", () => {
+      const config = new Config();
+      expect(config.TRUST_PROXY).toBe("");
+    });
+
     it("should register WEBHOOK_AUTHORIZATION_HEADER as a sensitive config field", () => {
       new Config();
       expect(capturedConfigFields).toContainEqual({
@@ -96,6 +101,13 @@ describe("Config", () => {
       new Config();
       expect(capturedConfigFields).toContainEqual({
         field: "WEBHOOK_RATE_LIMIT_PER_MINUTE",
+      });
+    });
+
+    it("should register TRUST_PROXY as a non-sensitive config field", () => {
+      new Config();
+      expect(capturedConfigFields).toContainEqual({
+        field: "TRUST_PROXY",
       });
     });
 

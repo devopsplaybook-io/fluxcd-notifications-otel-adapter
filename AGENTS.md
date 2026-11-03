@@ -13,6 +13,8 @@ fluxcd-notifications-otel-adapter/
     AppRoutes.ts          # Route registration: status endpoint, Flux webhook forwarding, rejections
     Config.ts             # Extends ConfigBase from @devopsplaybook.io/common-utils
     RateLimiter.ts        # In-process per-client-IP fixed-window rate limiter
+    RejectionLogSampler.ts # Bounded per-key 60 s sampler for rejection log lines
+    TrustProxy.ts         # Validates TRUST_PROXY into a Fastify trustProxy setting
     OTelContext.ts        # Calls createOTelContext() once and re-exports its accessors
     App.spec.ts           # Route integration tests (Fastify inject on registerRoutes)
     AppLifecycle.spec.ts  # Startup/shutdown and signal handling tests
@@ -20,6 +22,8 @@ fluxcd-notifications-otel-adapter/
     Config.spec.ts        # Config construction and reload delegation tests
     OTelContext.spec.ts   # OTelContext wiring tests
     RateLimiter.spec.ts   # Rate limiter tests
+    RejectionLogSampler.spec.ts # Rejection log sampler tests
+    TrustProxy.spec.ts    # TRUST_PROXY parsing tests
   config.json             # Default runtime configuration (empty object)
   Dockerfile              # Multi-stage build (node:26-alpine)
   docs/                   # Deployment examples (Kubernetes/Kustomize, Docker Compose)
@@ -56,14 +60,15 @@ Importing the `common-utils` barrel loads its full database and authentication s
 `src/Config.ts` extends `ConfigBase` with `serviceId = "fluxcd-notifications"`. Project-specific fields are registered with `addConfigField` in the constructor:
 
 - `WEBHOOK_AUTHORIZATION_HEADER` — optional shared-secret check on `POST /` (sensitive, masked in logs)
-- `WEBHOOK_RATE_LIMIT_PER_MINUTE` — per-client-IP limit, default `600`, `0` disables the limiter
+- `WEBHOOK_RATE_LIMIT_PER_MINUTE` — per-client-IP limit on every route, default `600`, `0` disables the limiter
+- `TRUST_PROXY` — Fastify client-IP model, empty by default (direct peer); `true` or a comma-separated list of IPs/CIDRs/keywords (`loopback`, `linklocal`, `uniquelocal`); an invalid value fails startup
 
 The constructor also overrides `VERSION` with the application's `package.json` version (`ConfigBase` otherwise reports the shared library's version, which breaks release identification in telemetry). The `reload()` method delegates to `super.reload()` with a logger callback; it is only called during startup.
 
 ### Request Flow
 
 1. FluxCD sends a POST to `/` with the Kubernetes Event object (severity, message, reason, involvedObject, metadata, reportingController, timestamp)
-2. Rate limiting runs first in the Fastify `onRequest` phase, before body parsing and before authentication: `WEBHOOK_RATE_LIMIT_PER_MINUTE` per client IP in a fixed 60 s window (at most 10 000 tracked clients); over the limit → `429` + `Retry-After`, counted as `rate_limited`
+2. Rate limiting runs first in the Fastify `onRequest` phase, before body parsing and before authentication. The limiter is a **root hook**, so it covers every route including `/api/status` and unknown routes (404s): `WEBHOOK_RATE_LIMIT_PER_MINUTE` per client IP in a fixed 60 s window (at most 10 000 tracked clients); over the limit → `429` + `Retry-After`, counted as `rate_limited`. The bucket key is the resolved client IP (never the shared authorization token); with `TRUST_PROXY` set, `request.ip` comes from `X-Forwarded-For` only for trusted peers, and a malformed value falls back to the socket address
 3. Authentication runs in the same `onRequest` phase, still before body parsing: when `WEBHOOK_AUTHORIZATION_HEADER` is set, the request must carry the exact same `Authorization` header (timing-safe, `401` + `WWW-Authenticate: Bearer` otherwise). An unauthenticated malformed or oversized body therefore gets `401`, not `400`/`413`
 4. Fastify rejects oversized bodies (`413`, 64 KiB limit) and unsupported content types (`415`) before the handler runs
 5. The handler requires only a non-empty `message`: a missing/blank message is `400 invalid_payload`. `reason` and `metadata.cluster` default to `unknown`; a non-string `severity` is treated as absent (`unknown`) without failing the request
@@ -71,7 +76,7 @@ The constructor also overrides `VERSION` with the application's `package.json` v
 7. Events are counted in `events_total{cluster, reason, severity}`; counters are only exported when a metrics endpoint is configured
 8. The response is `{"status":"ok"}`; a health check is available at `GET /api/status` → `{ started: true, version: "<version>" }`
 
-Rejection reasons counted exactly once in `rejected_events_total{reason}`: `invalid_payload` (400), `invalid_json` (400), `unauthorized` (401), `bad_request` (404 and other 4xx), `payload_too_large` (413), `unsupported_media_type` (415), `rate_limited` (429). Each rejection logs a WARN with route/status/reason; `invalid_payload` adds a sanitized ≤200-character excerpt, `invalid_json` deliberately logs no body. 5xx responses are logged at ERROR (with message and code) and are **not** counted as rejections; their response body is a fixed generic `{statusCode, error: "Internal Server Error"}`, never the thrown message/code.
+Rejection reasons counted exactly once in `rejected_events_total{reason}`: `invalid_payload` (400), `invalid_json` (400), `unauthorized` (401), `bad_request` (404 and other 4xx), `payload_too_large` (413), `unsupported_media_type` (415), `rate_limited` (429). Each rejection always increments the counter, but its log line is sampled: at most once per HTTP method (unknown methods collapse to `OTHER`), registered route template (`unmatched` for 404s), status and reason per rolling 60 s window; later events are reported as `suppressed=<n>` on the next line. 404s log at INFO, other rejections at WARN. The logged route is method + path without the query string. `invalid_payload` logs structure/type tokens only (`body_type=object key_count=… has_message=… message_type=…`), never key names or values; `invalid_json` logs no body. 5xx responses are logged at ERROR (with message and code) and are **not** counted as rejections; their response body is a fixed generic `{statusCode, error: "Internal Server Error"}`, never the thrown message/code.
 
 ### Severity
 
@@ -79,9 +84,11 @@ Rejection reasons counted exactly once in `rejected_events_total{reason}`: `inva
 
 ### Fastify Hooks and Limits
 
-`StandardTracerFastifyRegisterHooks` is registered with `rootApiPath: "/"` so webhook requests to `POST /` are traced (the default `/api` root silently skips them), and `ignoreList: ["GET-/api/status"]` to avoid tracing health checks.
+`StandardTracerFastifyRegisterHooks` is registered with `rootApiPath: "/"` so webhook requests to `POST /` are traced (the default `/api` root silently skips them), `ignoreList: ["GET-/api/status"]` to avoid tracing health checks, and `unmatchedRouteSpanName: "method"` so 404/429 spans are named `GET`/`POST` instead of attacker-controlled paths. `registerRoutes` is called **before** the tracing hooks so the global rate limiter runs first: a 429 short-circuits before a span is created. Routes, 404 handling and the limiter therefore all share the per-client bucket.
 
-Fixed Fastify limits (`src/App.ts`): body 64 KiB, connection timeout 10 s, request timeout 15 s, keep-alive timeout 72 s. Shutdown flushes telemetry with a 10 s bound. The log queue is 2 048 records; a worst-case record is ~75 KiB (16 384-code-point message up to ~64 KiB UTF-16 plus ~10 KiB of 256-code-point attributes), so a full queue can retain roughly 150 MiB and an in-flight export a second copy (~300 MiB).
+`TRUST_PROXY` is resolved by `src/TrustProxy.ts` and passed to Fastify `trustProxy`; startup logs the resulting client-IP model (direct peer, trust all forwarded headers, or trusted proxy ranges).
+
+Fixed Fastify limits (`src/App.ts`): body 64 KiB, connection timeout 10 s, request timeout 15 s, keep-alive timeout 72 s. Shutdown flushes telemetry with a 10 s bound. The log queue is 2 048 records; a worst-case record is ~75 KiB (16 384-code-point message up to ~64 KiB UTF-16 plus ~10 KiB of 256-code-point attributes), so a full queue can retain roughly 150 MiB and an in-flight export a second copy (~300 MiB). `otel-utils-fastify` additionally logs one WARN per client error (`statusCode < 500`), so a malformed/oversized body produces a library line plus the adapter's sampled record.
 
 ### Graceful Shutdown
 
@@ -112,7 +119,8 @@ Key inherited configuration values from `ConfigBase`:
 Project-specific configuration values:
 
 - `WEBHOOK_AUTHORIZATION_HEADER` — when set, `POST /` requires the exact same `Authorization` header (401 otherwise); empty by default (no auth, startup warning)
-- `WEBHOOK_RATE_LIMIT_PER_MINUTE` — per-client-IP limit over a fixed 60 s window; default `600`, `0` disables
+- `WEBHOOK_RATE_LIMIT_PER_MINUTE` — per-client-IP limit over a fixed 60 s window on every route; default `600`, `0` disables
+- `TRUST_PROXY` — client-IP model; empty by default (direct peer), `true` (trusts every `X-Forwarded-For`), or a comma-separated list of trusted proxy IPs/CIDRs/keywords
 
 ## Docker
 
@@ -126,7 +134,7 @@ Project-specific configuration values:
 GitHub Actions workflows use reusable workflows from `devopsplaybook-io/common-utils`:
 
 - `pr-check.yml` — runs on PR to `main`: version check, `npm ci`, build, lint, test, coverage upload, audit gate (high/critical production advisories) and Docker build/push of `beta-pr-<n>` and `beta`
-- `main-build.yml` — runs on merge to `main`: audit and promotion of the exact PR-validated image to `0.10.0`, `0.10`, `0`, `latest` and `beta` (no rebuild)
+- `main-build.yml` — runs on merge to `main`: audit and promotion of the exact PR-validated image to `0.11.0`, `0.11`, `0`, `latest` and `beta` (no rebuild)
 
 ## Post-Change Validation
 
@@ -138,7 +146,7 @@ npm run lint     # oxlint check
 npm test         # Jest tests with coverage
 ```
 
-All three must pass. Jest enforces global coverage thresholds of 85% statements, 80% branches, 85% functions and 85% lines (`jest.config.js`). Current numbers on `main`: 133 tests, 97.59% statements/lines, 93.61% branches, 100% functions.
+All three must pass. Jest enforces global coverage thresholds of 85% statements, 80% branches, 85% functions and 85% lines (`jest.config.js`). Current numbers on `main`: 194 tests, 97.61% statements/lines, 94.02% branches, 100% functions.
 
 For changes touching deployment examples or documentation paths, also verify the Kustomize output still builds:
 
