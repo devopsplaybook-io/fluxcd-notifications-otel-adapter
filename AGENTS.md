@@ -93,11 +93,11 @@ Rejection reasons counted exactly once in `rejected_events_total{reason}`: `inva
 
 `TRUST_PROXY` is resolved by `src/TrustProxy.ts` and passed to Fastify `trustProxy`; startup logs the resulting client-IP model (direct peer, trust all forwarded headers, or trusted proxy ranges).
 
-Fixed Fastify limits (`src/App.ts`): body 64 KiB, connection timeout 10 s, request timeout 15 s, keep-alive timeout 72 s. Shutdown flushes telemetry with a 10 s bound. The log queue is 2 048 records; a worst-case record is ~75 KiB (16 384-code-point message up to ~64 KiB UTF-16 plus ~10 KiB of 256-code-point attributes), so a full queue can retain roughly 150 MiB and an in-flight export a second copy (~300 MiB). `otel-utils-fastify` additionally logs one WARN per client error (`statusCode < 500`), so a malformed/oversized body produces a library line plus the adapter's sampled record.
+Fixed Fastify limits (`src/App.ts`): body 64 KiB, connection timeout 10 s, request timeout 15 s, keep-alive timeout 72 s. Shutdown closes the HTTP server and flushes telemetry under a single 10 s bound (exit 1 when either fails, 0 on a clean or timed-out shutdown). The log queue is 2 048 records; a worst-case record is ~75 KiB (16 384-code-point message up to ~64 KiB UTF-16 plus ~10 KiB of 256-code-point attributes), so a full queue can retain roughly 150 MiB and an in-flight export a second copy (~300 MiB). `otel-utils-fastify` additionally logs one WARN per client error (`statusCode < 500`), so a malformed/oversized body produces a library line plus the adapter's sampled record.
 
 ### Graceful Shutdown
 
-On `SIGTERM`/`SIGINT` the server stops accepting requests, closes Fastify, flushes logs/traces/metrics with a 10 s bound and exits 0; a second signal exits immediately with code 1.
+On `SIGTERM`/`SIGINT` the server stops accepting requests, closes Fastify and flushes logs/traces/metrics under one 10 s bound: it exits 1 when the close or a flush fails and 0 on a clean shutdown or when the bound is reached; a second signal exits immediately with code 1.
 
 ## Configuration
 
@@ -142,7 +142,7 @@ Project-specific configuration values:
 GitHub Actions workflows use reusable workflows from `devopsplaybook-io/common-utils`:
 
 - `pr-check.yml` — runs on PR to `main`: version check, `npm ci`, build, lint, test, coverage upload, audit gate (high/critical production advisories) and Docker build/push of `beta-pr-<n>` and `beta`
-- `main-build.yml` — runs on merge to `main`: audit and promotion of the exact PR-validated image to `0.13.0`, `0.13`, `0`, `latest` and `beta` (no rebuild)
+- `main-build.yml` — runs on merge to `main`: audit and promotion of the exact PR-validated image to `0.14.0`, `0.14`, `0`, `latest` and `beta` (no rebuild)
 
 ## Post-Change Validation
 
@@ -154,7 +154,7 @@ npm run lint     # oxlint check
 npm test         # Jest tests with coverage
 ```
 
-All three must pass. Jest enforces global coverage thresholds of 85% statements, 80% branches, 85% functions and 85% lines (`jest.config.js`). Current numbers on `main`: 205 tests, 97.68% statements/lines, 94.26% branches, 100% functions.
+All three must pass. Jest enforces global coverage thresholds of 85% statements, 80% branches, 85% functions and 85% lines (`jest.config.js`). Current numbers on `main`: 207 tests, 98.09% statements/lines, 94.13% branches, 100% functions.
 
 For changes touching deployment examples or documentation paths, also verify the Kustomize output still builds:
 
