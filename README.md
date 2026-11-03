@@ -4,15 +4,15 @@ FluxCD Notifications OpenTelemetry Adapter is a lightweight server that receives
 
 ## How events are forwarded
 
-An accepted webhook event is emitted as **one OpenTelemetry log record when `OPENTELEMETRY_COLLECTOR_HTTP_LOGS` is set**. Every accepted event also prints a console line in the pod logs, whether or not a collector is configured:
+An accepted webhook event is emitted as **one OpenTelemetry log record when `OPENTELEMETRY_COLLECTOR_HTTP_LOGS` is set**. Every accepted event also prints a console line in the pod logs, unless `OPENTELEMETRY_CONSOLE_LOG_MODE` suppresses it (`fallback` with a collector configured, or `never`):
 
 ```text
 [info] [fluxcd-notifications] my-cluster: ReconciliationSucceeded - Reconciliation finished in 1.2s
 ```
 
-The body of the console line is `<cluster>: <reason> - <message>`, prefixed with the mapped log level (`info`, `warn` or `error`) and the fixed module name `fluxcd-notifications`.
+The body of the console line is `<cluster>: <reason> - <message>`, prefixed with the mapped log level (`info`, `warn` or `error`) and the fixed module name `fluxcd-notifications`. Info lines go to stdout, warn and error lines to stderr.
 
-With no logs endpoint configured, no record is exported: the same line is printed through the internal module logger, which is the console-only fallback. Metrics and traces have their own optional endpoints (see [Metrics](#metrics)).
+`OPENTELEMETRY_CONSOLE_LOG_MODE` controls this mirroring: `always` (default) prints the line whether or not a collector is configured; `fallback` prints it only when no logs endpoint is configured; `never` suppresses it. An invalid value behaves like `always`. With no logs endpoint configured, no record is exported: the same line is printed through the internal module logger, which is the console-only fallback and honours the same mode. Metrics and traces have their own optional endpoints (see [Metrics](#metrics)).
 
 Delivery semantics:
 
@@ -174,13 +174,13 @@ curl -s -X POST http://localhost:8080/ \
 
 With webhook authentication enabled, add the matching header to the request: `-H "Authorization: Bearer <shared-secret>"` (see [Securing the webhook endpoint](#securing-the-webhook-endpoint)); without it the request is rejected with `401`.
 
-The adapter always prints `[info] [fluxcd-notifications] my-cluster: ReconciliationSucceeded - Reconciliation finished in 1.2s` to the pod logs. When a logs endpoint is configured, the collector also receives an INFO record with that body and the `flux.*` attributes listed above, so failed reconciliations (`severity: error`) show up as ERROR records filterable by cluster, object and reason. Without a logs endpoint, the console line is the only output.
+The adapter prints `[info] [fluxcd-notifications] my-cluster: ReconciliationSucceeded - Reconciliation finished in 1.2s` to the pod logs unless `OPENTELEMETRY_CONSOLE_LOG_MODE` is `fallback` with a collector configured or `never`. When a logs endpoint is configured, the collector also receives an INFO record with that body and the `flux.*` attributes listed above, so failed reconciliations (`severity: error`) show up as ERROR records filterable by cluster, object and reason. Without a logs endpoint, the console line is the only output.
 
 ## Installation
 
 This adapter is meant to be deployed alongside your FluxCD installation in Kubernetes.
 
-The Kustomize base in [docs/deployments/kubernetes/kubernetes](docs/deployments/kubernetes/kubernetes) is the authoritative example; the [kubernetes-nodeport](docs/deployments/kubernetes/kubernetes-nodeport) overlay changes only the Service type. It deploys the image pinned to `0.12.0`, enables the logs collector, leaves the traces and metrics endpoints empty, requires the webhook Secret to be created before applying the manifests (`WEBHOOK_AUTH_REQUIRED=true`) and includes a NetworkPolicy (see [Securing the webhook endpoint](#securing-the-webhook-endpoint)).
+The Kustomize base in [docs/deployments/kubernetes/kubernetes](docs/deployments/kubernetes/kubernetes) is the authoritative example; the [kubernetes-nodeport](docs/deployments/kubernetes/kubernetes-nodeport) overlay changes only the Service type. It deploys the image pinned to `0.13.0`, enables the logs collector, leaves the traces and metrics endpoints empty, requires the webhook Secret to be created before applying the manifests (`WEBHOOK_AUTH_REQUIRED=true`) and includes a NetworkPolicy (see [Securing the webhook endpoint](#securing-the-webhook-endpoint)).
 
 ### Kustomize
 
@@ -269,7 +269,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - image: devopsplaybookio/fluxcd-notifications-otel-adapter:0.12.0
+        - image: devopsplaybookio/fluxcd-notifications-otel-adapter:0.13.0
           name: fluxcd-notifications-otel-adapter
           # Authorization headers are secrets: they must come from a Secret
           # (secretKeyRef), never from a ConfigMap or config.json.
@@ -408,6 +408,7 @@ Configuration can be provided as environment variables or through `config.json`.
 | `WEBHOOK_AUTH_REQUIRED`                                 | Fail closed: refuse startup when the webhook header is empty                | `false`               | Config file or environment variable |
 | `WEBHOOK_RATE_LIMIT_PER_MINUTE`                         | Per-client-IP rate limit on every route; `0` disables the limiter           | `600`                 | Config file or environment variable |
 | `TRUST_PROXY`                                           | Client-IP model: empty/false (direct peer), `true`, or trusted proxy IPs/CIDRs | (empty)            | Config file or environment variable |
+| `OPENTELEMETRY_CONSOLE_LOG_MODE`                        | Console mirroring: always, fallback (only without a collector) or never      | `always`              | Config file or environment variable |
 
 `OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER` takes the token only; the adapter adds the `Bearer ` prefix.
 
@@ -513,9 +514,9 @@ The Kustomize base includes a [NetworkPolicy](docs/deployments/kubernetes/kubern
 
 To verify the adapter is forwarding:
 
-- `kubectl logs -n fluxcd-notifications-otel-adapter deploy/fluxcd-notifications-otel-adapter` — each accepted event prints a `[level] [fluxcd-notifications] …` line;
+- `kubectl logs -n fluxcd-notifications-otel-adapter deploy/fluxcd-notifications-otel-adapter` — each accepted event prints a `[level] [fluxcd-notifications] …` line unless `OPENTELEMETRY_CONSOLE_LOG_MODE` is `fallback` with a collector configured or `never`;
 - query otel-light for the service name `fluxcd-notifications`, e.g. `GET /api/analytics/logs?serviceName=fluxcd-notifications&keywords=<cluster>`;
-- `GET /api/status` returns `{"started": true, "version": "0.12.0"}`.
+- `GET /api/status` returns `{"started": true, "version": "0.13.0"}`.
 
 Useful alerts:
 
@@ -527,7 +528,9 @@ When correlating with traces, select on the `trace.id`/`span.id` attributes; tha
 
 ## Startup and packaging
 
-The adapter imports `@devopsplaybook.io/common-utils`, whose barrel entry point loads the full database and authentication stack (better-sqlite3, pg, bcrypt, jsonwebtoken, axios). This costs roughly 563 modules and ~0.4 s at startup even though the adapter uses none of those features, and it is why the Docker builder installs native build tooling (`python3`, `perl`, `alpine-sdk`) to compile better-sqlite3.
+The adapter imports only the `common-utils` subpaths it needs: `ConfigBase` from `@devopsplaybook.io/common-utils/config` and `createOTelContext` from `@devopsplaybook.io/common-utils/otel`. The barrel entry point would also load the full database and authentication stack (better-sqlite3, pg, bcrypt, jsonwebtoken, axios) even though the adapter uses none of it; the subpaths avoid those modules at startup (measured on Node 26, median of 5/3 runs: `Config` + `OTelContext` 560 modules / ~223 ms with the barrel versus 328 modules / ~112 ms with the subpaths; a full `dist/App.js` import drops from 658 modules / ~257 ms to 473 modules / ~155 ms).
+
+`npm ci` still needs native build tooling (`python3`, `perl`, `alpine-sdk`) because `common-utils` declares those DB modules as regular dependencies, so they are installed and compiled even though the subpath imports never load them. The runtime image therefore still contains better-sqlite3, bcrypt and pg; removing them requires a shared-library change (out of scope here).
 
 The production image is `node:26-alpine`, contains only the compiled `dist/`, `node_modules` and `config.json` (about 137 packages), runs as the unprivileged `node` user (UID 1000) and works with a read-only root filesystem — only `/tmp` needs a writable volume.
 

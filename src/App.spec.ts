@@ -46,6 +46,7 @@ function buildConfig(overrides: Partial<Config> = {}): Config {
     WEBHOOK_AUTHORIZATION_HEADER: "",
     WEBHOOK_AUTH_REQUIRED: false,
     WEBHOOK_RATE_LIMIT_PER_MINUTE: 600,
+    OPENTELEMETRY_CONSOLE_LOG_MODE: "always",
     ...overrides,
   } as unknown as Config;
 }
@@ -157,6 +158,8 @@ describe("App API routes", () => {
   beforeEach(() => {
     jest.clearAllMocks();
     jest.spyOn(console, "log").mockImplementation(() => {});
+    jest.spyOn(console, "warn").mockImplementation(() => {});
+    jest.spyOn(console, "error").mockImplementation(() => {});
     config = buildConfig();
     fastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
     registerRoutes(fastify, config);
@@ -235,6 +238,64 @@ describe("App API routes", () => {
       );
     });
 
+    it("should not mirror to the console when the mode is never", async () => {
+      const neverFastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
+      registerRoutes(
+        neverFastify,
+        buildConfig({ OPENTELEMETRY_CONSOLE_LOG_MODE: "never" }),
+      );
+
+      await neverFastify.inject({
+        method: "POST",
+        url: "/",
+        payload: fullFluxPayload(),
+      });
+      await neverFastify.close();
+
+      expect(mockRawEmit).toHaveBeenCalledTimes(1);
+      expect(console.log).not.toHaveBeenCalled();
+      expect(console.warn).not.toHaveBeenCalled();
+      expect(console.error).not.toHaveBeenCalled();
+    });
+
+    it("should not mirror to the console when the mode is fallback and a collector exists", async () => {
+      const fallbackFastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
+      registerRoutes(
+        fallbackFastify,
+        buildConfig({ OPENTELEMETRY_CONSOLE_LOG_MODE: "fallback" }),
+      );
+
+      await fallbackFastify.inject({
+        method: "POST",
+        url: "/",
+        payload: fullFluxPayload(),
+      });
+      await fallbackFastify.close();
+
+      expect(mockRawEmit).toHaveBeenCalledTimes(1);
+      expect(console.log).not.toHaveBeenCalled();
+    });
+
+    it("should mirror to the console for an invalid mode like always", async () => {
+      const invalidFastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
+      registerRoutes(
+        invalidFastify,
+        buildConfig({ OPENTELEMETRY_CONSOLE_LOG_MODE: "bogus" as never }),
+      );
+
+      await invalidFastify.inject({
+        method: "POST",
+        url: "/",
+        payload: fullFluxPayload(),
+      });
+      await invalidFastify.close();
+
+      expect(mockRawEmit).toHaveBeenCalledTimes(1);
+      expect(console.log).toHaveBeenCalledWith(
+        "[info] [fluxcd-notifications] production-us-east-1: ReconciliationSucceeded - Deployment my-app applied successfully",
+      );
+    });
+
     it("should fall back to module logger only when no OTel logger is available", async () => {
       mockGetLogger.mockReturnValueOnce(undefined);
       const fallbackFastify = Fastify({ logger: false, ...FASTIFY_OPTIONS });
@@ -259,7 +320,7 @@ describe("App API routes", () => {
 
       await postEvent(payload);
 
-      expect(console.log).toHaveBeenCalledWith(
+      expect(console.error).toHaveBeenCalledWith(
         "[error] [fluxcd-notifications] production-us-east-1: ReconciliationSucceeded - Deployment my-app applied successfully",
       );
     });
@@ -290,7 +351,7 @@ describe("App API routes", () => {
 
       await postEvent(payload);
 
-      expect(console.log).toHaveBeenCalledWith(
+      expect(console.warn).toHaveBeenCalledWith(
         "[warn] [fluxcd-notifications] production-us-east-1: ReconciliationSucceeded - Deployment my-app applied successfully",
       );
     });

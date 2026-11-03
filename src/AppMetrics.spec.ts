@@ -51,6 +51,7 @@ function buildConfig(overrides: Partial<Config> = {}): Config {
     WEBHOOK_AUTHORIZATION_HEADER: "",
     WEBHOOK_AUTH_REQUIRED: false,
     WEBHOOK_RATE_LIMIT_PER_MINUTE: 600,
+    OPENTELEMETRY_CONSOLE_LOG_MODE: "always",
     ...overrides,
   } as unknown as Config;
 }

@@ -25,19 +25,20 @@ fluxcd-notifications-otel-adapter/
     RejectionLogSampler.spec.ts # Rejection log sampler tests
     TrustProxy.spec.ts    # TRUST_PROXY parsing tests
   config.json             # Default runtime configuration (empty object)
+  .nvmrc                  # Node.js 26 (matches engines and node:26-alpine)
   Dockerfile              # Multi-stage build (node:26-alpine)
   docs/                   # Deployment examples (Kubernetes/Kustomize with NetworkPolicy, Docker Compose)
 ```
 
 ## Coding Conventions
 
-- **Language**: TypeScript (strict mode off, ES6 target, CommonJS modules)
-- **Runtime**: Node.js 26
+- **Language**: TypeScript (strict mode off, ES6 target, CommonJS modules); enabling strict mode is a separate future change, not part of a bug fix or feature PR
+- **Runtime**: Node.js 26 (`engines.node >= 26` in `package.json`, `.nvmrc`)
 - **Build**: `tsc` compiles `src/` to `dist/` (with `skipLibCheck: true`), then type-checks the spec files (`tsc -p tsconfig.spec.json --noEmit`)
 - **Dev mode**: `tsx watch ./src/App.ts`
 - **Tests**: Jest with `@swc/jest` (v8 coverage provider), spec files named `*.spec.ts` alongside source, run with `npm test`
 - **Linting**: oxlint (recommended preset)
-- **Config loading**: `Config` extends `ConfigBase` from `@devopsplaybook.io/common-utils`; env vars override config.json which overrides defaults. The configuration is loaded **once** at startup and there is **no reload or file watcher**: every change requires a process/rollout restart.
+- **Config loading**: `Config` extends `ConfigBase` from `@devopsplaybook.io/common-utils/config`; env vars override config.json which overrides defaults. The configuration is loaded **once** at startup and there is **no reload or file watcher**: every change requires a process/rollout restart.
 - **Secrets in logs**: Sensitive config values (authorization headers, keys) are masked as `********************` by `ConfigBase.reload()`
 
 ## Architecture
@@ -49,7 +50,9 @@ This project consumes two shared libraries from `devopsplaybook.io/_libs/`:
 - **`@devopsplaybook.io/common-utils`** — provides `ConfigBase` (config loading with env/file/default layering, type coercion, sensitive field masking) and `createOTelContext` (tracer/meter/logger singleton factory)
 - **`@devopsplaybook.io/otel-utils-fastify`** — provides `StandardTracerFastifyRegisterHooks` for automatic request tracing via Fastify hooks
 
-Importing the `common-utils` barrel loads its full database and authentication stack (better-sqlite3, pg, bcrypt, jsonwebtoken, axios; ~563 modules, ~0.4 s) even though this adapter uses none of it. That is why the Docker builder needs native build tooling.
+Always import from the subpaths, never the barrel: `ConfigBase` from `@devopsplaybook.io/common-utils/config` and `createOTelContext` from `@devopsplaybook.io/common-utils/otel`. The barrel would also load the full database and authentication stack (better-sqlite3, pg, bcrypt, jsonwebtoken, axios) even though this adapter uses none of it; the subpaths keep startup at ~328 modules / ~112 ms for `Config` + `OTelContext` (a full `dist/App.js` import is ~473 modules / ~155 ms) instead of ~560 / ~223 ms and ~658 / ~257 ms.
+
+`npm ci` still needs native build tooling because `common-utils` declares those DB modules as regular dependencies, so they are installed and compiled; the subpath imports never load them at runtime.
 
 ### OTelContext Pattern
 
@@ -63,6 +66,7 @@ Importing the `common-utils` barrel loads its full database and authentication s
 - `WEBHOOK_AUTH_REQUIRED` — boolean, default `false`: when `true`, startup refuses to continue if `WEBHOOK_AUTHORIZATION_HEADER` is empty (fail closed); when `false`, an empty header only logs a warning (backward-compatible fail-open)
 - `WEBHOOK_RATE_LIMIT_PER_MINUTE` — per-client-IP limit on every route, default `600`, `0` disables the limiter
 - `TRUST_PROXY` — Fastify client-IP model, empty by default (direct peer); `true` or a comma-separated list of IPs/CIDRs/keywords (`loopback`, `linklocal`, `uniquelocal`); an invalid value fails startup
+- `OPENTELEMETRY_CONSOLE_LOG_MODE` — console mirroring for module-logger records, default `always`; `fallback` mirrors only when no logs endpoint is configured, `never` suppresses; an invalid value behaves like `always`. Applies to accepted-event lines and, through the module logger, rejection lines
 
 The constructor also overrides `VERSION` with the application's `package.json` version (`ConfigBase` otherwise reports the shared library's version, which breaks release identification in telemetry). The `reload()` method delegates to `super.reload()` with a logger callback; it is only called during startup.
 
@@ -73,7 +77,7 @@ The constructor also overrides `VERSION` with the application's `package.json` v
 3. Authentication runs in the same `onRequest` phase, still before body parsing: when `WEBHOOK_AUTHORIZATION_HEADER` is set, the request must carry the exact same `Authorization` header (timing-safe, `401` + `WWW-Authenticate: Bearer` otherwise). An unauthenticated malformed or oversized body therefore gets `401`, not `400`/`413`. Authentication is active whenever the header is set regardless of `WEBHOOK_AUTH_REQUIRED`; the switch only adds a fail-closed startup guard (refuses to start when required but the header is empty). The authorization headers are secrets provided as environment variables (in Kubernetes via `secretKeyRef` from a Secret), never from `config.json` or a ConfigMap
 4. Fastify rejects oversized bodies (`413`, 64 KiB limit) and unsupported content types (`415`) before the handler runs
 5. The handler requires only a non-empty `message`: a missing/blank message is `400 invalid_payload`. `reason` and `metadata.cluster` default to `unknown`; a non-string `severity` is treated as absent (`unknown`) without failing the request
-6. Accepted events are emitted as one OTel log record via `StandardLogger.getLogger().emit()` when a logs endpoint is configured: severity mapped from the Flux severity (info→INFO, error→ERROR, warn/warning→WARN, else INFO), body `<cluster>: <reason> - <message>`, and `flux.*` attributes (cluster, reason, severity, object kind/name/namespace/apiVersion/uid, revision, reporting_controller, `flux.message.truncated`, `flux.attributes.truncated` when applicable) with the request OTel context attached. A console line `[level] [fluxcd-notifications] <body>` is always printed; with no logs endpoint the event goes to the console only through the module logger. Every input-derived string attribute is capped at 256 code points (code-point aware, never splitting a surrogate pair)
+6. Accepted events are emitted as one OTel log record via `StandardLogger.getLogger().emit()` when a logs endpoint is configured: severity mapped from the Flux severity (info→INFO, error→ERROR, warn/warning→WARN, else INFO), body `<cluster>: <reason> - <message>`, and `flux.*` attributes (cluster, reason, severity, object kind/name/namespace/apiVersion/uid, revision, reporting_controller, `flux.message.truncated`, `flux.attributes.truncated` when applicable) with the request OTel context attached. A console line `[level] [fluxcd-notifications] <body>` is printed unless `OPENTELEMETRY_CONSOLE_LOG_MODE` is `fallback` with a logs endpoint configured or `never` (info → stdout, warn/error → stderr); with no logs endpoint the event goes to the console only through the module logger, which honours the same mode. Every input-derived string attribute is capped at 256 code points (code-point aware, never splitting a surrogate pair)
 7. Events are counted in `events_total{cluster, reason, severity}`; counters are only exported when a metrics endpoint is configured
 8. The response is `{"status":"ok"}`; a health check is available at `GET /api/status` → `{ started: true, version: "<version>" }`
 
@@ -123,10 +127,11 @@ Project-specific configuration values:
 - `WEBHOOK_AUTH_REQUIRED` — boolean, default `false`; when `true`, startup refuses to continue if `WEBHOOK_AUTHORIZATION_HEADER` is empty (fail closed); when `false`, an empty header only logs a warning (backward-compatible fail-open)
 - `WEBHOOK_RATE_LIMIT_PER_MINUTE` — per-client-IP limit over a fixed 60 s window on every route; default `600`, `0` disables
 - `TRUST_PROXY` — client-IP model; empty by default (direct peer), `true` (trusts every `X-Forwarded-For`), or a comma-separated list of trusted proxy IPs/CIDRs/keywords
+- `OPENTELEMETRY_CONSOLE_LOG_MODE` — console mirroring for accepted events and module-logger records; default `always`, `fallback` only without a logs endpoint, `never` suppresses; an invalid value behaves like `always`
 
 ## Docker
 
-- Multi-stage build: `node:26-alpine` builder installs `python3 perl alpine-sdk` to compile native modules, then builds and prunes; slim `node:26-alpine` runtime
+- Multi-stage build: `node:26-alpine` builder installs `python3 perl alpine-sdk` to compile native modules (bash/git are not needed: there are no git-resolved dependencies), then builds and prunes; slim `node:26-alpine` runtime. The runtime image still contains the unused better-sqlite3/bcrypt/pg modules because `common-utils` declares them; removing them requires a shared-library change
 - Runtime command: `node dist/App.js` (explicit `CMD ["node", "dist/App.js"]`)
 - Runs as `USER node` (UID 1000) and works with a read-only root filesystem; only `/tmp` needs a writable volume
 - Production dependency tree is about 137 packages; config is mounted at `/opt/app/config.json` via a Kubernetes ConfigMap
@@ -137,7 +142,7 @@ Project-specific configuration values:
 GitHub Actions workflows use reusable workflows from `devopsplaybook-io/common-utils`:
 
 - `pr-check.yml` — runs on PR to `main`: version check, `npm ci`, build, lint, test, coverage upload, audit gate (high/critical production advisories) and Docker build/push of `beta-pr-<n>` and `beta`
-- `main-build.yml` — runs on merge to `main`: audit and promotion of the exact PR-validated image to `0.12.0`, `0.12`, `0`, `latest` and `beta` (no rebuild)
+- `main-build.yml` — runs on merge to `main`: audit and promotion of the exact PR-validated image to `0.13.0`, `0.13`, `0`, `latest` and `beta` (no rebuild)
 
 ## Post-Change Validation
 
@@ -149,7 +154,7 @@ npm run lint     # oxlint check
 npm test         # Jest tests with coverage
 ```
 
-All three must pass. Jest enforces global coverage thresholds of 85% statements, 80% branches, 85% functions and 85% lines (`jest.config.js`). Current numbers on `main`: 200 tests, 97.65% statements/lines, 94.16% branches, 100% functions.
+All three must pass. Jest enforces global coverage thresholds of 85% statements, 80% branches, 85% functions and 85% lines (`jest.config.js`). Current numbers on `main`: 205 tests, 97.68% statements/lines, 94.26% branches, 100% functions.
 
 For changes touching deployment examples or documentation paths, also verify the Kustomize output still builds:
 

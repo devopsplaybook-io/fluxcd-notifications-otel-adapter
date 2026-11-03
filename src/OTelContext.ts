@@ -1,4 +1,4 @@
-import { createOTelContext } from "@devopsplaybook.io/common-utils";
+import { createOTelContext } from "@devopsplaybook.io/common-utils/otel";
 
 const otelContext = createOTelContext();
 

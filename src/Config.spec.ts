@@ -15,7 +15,7 @@ const mockReload = jest.fn().mockResolvedValue(undefined);
 let capturedServiceId: string | undefined;
 let capturedConfigFields: Array<{ field: string; sensitive?: boolean }> = [];
 
-jest.mock("@devopsplaybook.io/common-utils", () => ({
+jest.mock("@devopsplaybook.io/common-utils/config", () => ({
   ConfigBase: class MockConfigBase {
     public SERVICE_ID: string;
     public VERSION = "0.3.0";
@@ -94,6 +94,11 @@ describe("Config", () => {
       expect(config.TRUST_PROXY).toBe("");
     });
 
+    it("should default OPENTELEMETRY_CONSOLE_LOG_MODE to always", () => {
+      const config = new Config();
+      expect(config.OPENTELEMETRY_CONSOLE_LOG_MODE).toBe("always");
+    });
+
     it("should register WEBHOOK_AUTHORIZATION_HEADER as a sensitive config field", () => {
       new Config();
       expect(capturedConfigFields).toContainEqual({
@@ -120,6 +125,13 @@ describe("Config", () => {
       new Config();
       expect(capturedConfigFields).toContainEqual({
         field: "TRUST_PROXY",
+      });
+    });
+
+    it("should register OPENTELEMETRY_CONSOLE_LOG_MODE as a non-sensitive config field", () => {
+      new Config();
+      expect(capturedConfigFields).toContainEqual({
+        field: "OPENTELEMETRY_CONSOLE_LOG_MODE",
       });
     });
 
