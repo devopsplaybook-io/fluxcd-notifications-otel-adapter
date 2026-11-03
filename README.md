@@ -54,13 +54,13 @@ The record body is `<cluster>: <reason> - <message>`. Structured attributes:
 | `flux.reporting_controller` | `reportingController` of the emitting Flux controller, when present; truncated to 256 code points           |
 | `flux.message.truncated`    | `true` only when the message exceeded 16 384 code points and was truncated                                  |
 | `flux.attributes.truncated` | `true` only when a non-message input attribute was truncated to 256 code points                             |
-| `trace.id` / `span.id`      | Request trace/span correlation attributes added when a logs endpoint is configured                         |
+| `trace.id` / `span.id`      | Request trace/span correlation attributes added when a logs endpoint is configured; joinable to a trace only when a traces endpoint is also configured (see below) |
 
 Every input-derived string attribute is capped at 256 code points; truncation never splits a surrogate pair. Truncation of a non-message attribute sets `flux.attributes.truncated=true`.
 
 When metadata carries several `…/revision` keys, the kustomize, helm, source then notification revision is used, in that order, followed by the alphabetically first remaining key.
 
-otel-light correlates adapter logs with traces through the `trace.id` and `span.id` **attributes**, not the OTLP trace/span identifiers on the record. The attributes are generated whenever a logs endpoint is set, even if no traces endpoint is configured.
+otel-light correlates adapter logs with traces through the `trace.id` and `span.id` **attributes**, not the OTLP trace/span identifiers on the record. The attributes are populated from the request span whenever a logs endpoint is set — even if no traces endpoint is configured — but without `OPENTELEMETRY_COLLECTOR_HTTP_TRACES` no spans are exported anywhere, so the IDs cannot be joined to a trace; they only support log↔trace correlation once a traces endpoint exists.
 
 ## Accepted payload
 
@@ -172,13 +172,15 @@ curl -s -X POST http://localhost:8080/ \
 # {"status":"ok"}
 ```
 
+With webhook authentication enabled, add the matching header to the request: `-H "Authorization: Bearer <shared-secret>"` (see [Securing the webhook endpoint](#securing-the-webhook-endpoint)); without it the request is rejected with `401`.
+
 The adapter always prints `[info] [fluxcd-notifications] my-cluster: ReconciliationSucceeded - Reconciliation finished in 1.2s` to the pod logs. When a logs endpoint is configured, the collector also receives an INFO record with that body and the `flux.*` attributes listed above, so failed reconciliations (`severity: error`) show up as ERROR records filterable by cluster, object and reason. Without a logs endpoint, the console line is the only output.
 
 ## Installation
 
 This adapter is meant to be deployed alongside your FluxCD installation in Kubernetes.
 
-The Kustomize base in [docs/deployments/kubernetes/kubernetes](docs/deployments/kubernetes/kubernetes) is the authoritative example; the [kubernetes-nodeport](docs/deployments/kubernetes/kubernetes-nodeport) overlay changes only the Service type. It deploys the image pinned to `0.11.0`, enables the logs collector and leaves the traces and metrics endpoints empty.
+The Kustomize base in [docs/deployments/kubernetes/kubernetes](docs/deployments/kubernetes/kubernetes) is the authoritative example; the [kubernetes-nodeport](docs/deployments/kubernetes/kubernetes-nodeport) overlay changes only the Service type. It deploys the image pinned to `0.12.0`, enables the logs collector, leaves the traces and metrics endpoints empty, requires the webhook Secret to be created before applying the manifests (`WEBHOOK_AUTH_REQUIRED=true`) and includes a NetworkPolicy (see [Securing the webhook endpoint](#securing-the-webhook-endpoint)).
 
 ### Kustomize
 
@@ -190,7 +192,17 @@ kubectl kustomize . | kubectl apply -f -
 
 ### Plain manifests
 
-The following manifests are equivalent to the Kustomize base:
+The following manifests are equivalent to the Kustomize base. The authorization headers come from a Secret, so create it **before** applying the Deployment — the container references it with `secretKeyRef` and stays in `CreateContainerConfigError` until the Secret exists:
+
+```bash
+kubectl apply -f namespace.yaml
+kubectl -n fluxcd-notifications-otel-adapter create secret generic \
+  fluxcd-notifications-otel-adapter-secret \
+  --from-literal=WEBHOOK_AUTHORIZATION_HEADER='Bearer <shared-secret>'
+# Optional collector token:
+# kubectl -n fluxcd-notifications-otel-adapter patch secret fluxcd-notifications-otel-adapter-secret \
+#   -p '{"stringData":{"OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER":"<collector-token>"}}'
+```
 
 ```yaml
 # namespace.yaml
@@ -223,7 +235,7 @@ data:
       "OPENTELEMETRY_COLLECTOR_HTTP_LOGS": "http://otel-light.otel-light.svc.cluster.local:8080/v1/logs",
       "OPENTELEMETRY_COLLECTOR_EXPORT_LOGS_INTERVAL_SECONDS": "60",
       "OPENTELEMETRY_COLLECTOR_EXPORT_METRICS_INTERVAL_SECONDS": "60",
-      "OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER": "",
+      "WEBHOOK_AUTH_REQUIRED": true,
       "TRUST_PROXY": ""
     }
 ---
@@ -257,8 +269,22 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - image: devopsplaybookio/fluxcd-notifications-otel-adapter:0.11.0
+        - image: devopsplaybookio/fluxcd-notifications-otel-adapter:0.12.0
           name: fluxcd-notifications-otel-adapter
+          # Authorization headers are secrets: they must come from a Secret
+          # (secretKeyRef), never from a ConfigMap or config.json.
+          env:
+            - name: WEBHOOK_AUTHORIZATION_HEADER
+              valueFrom:
+                secretKeyRef:
+                  name: fluxcd-notifications-otel-adapter-secret
+                  key: WEBHOOK_AUTHORIZATION_HEADER
+            - name: OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER
+              valueFrom:
+                secretKeyRef:
+                  name: fluxcd-notifications-otel-adapter-secret
+                  key: OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER
+                  optional: true
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
@@ -323,12 +349,40 @@ spec:
       targetPort: 8080
   selector:
     app: fluxcd-notifications-otel-adapter
+---
+# networkpolicy.yaml
+# Only the Flux notification-controller may reach the webhook port. Kubelet
+# probe traffic to/from the pod's node is exempt from NetworkPolicy, so the
+# /api/status probes keep working; NetworkPolicy cannot restrict by HTTP path.
+# Adjust the namespace/pod labels if Flux is installed elsewhere.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: fluxcd-notifications-otel-adapter
+  namespace: fluxcd-notifications-otel-adapter
+spec:
+  podSelector:
+    matchLabels:
+      app: fluxcd-notifications-otel-adapter
+  policyTypes:
+    - Ingress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: flux-system
+          podSelector:
+            matchLabels:
+              app: notification-controller
+      ports:
+        - protocol: TCP
+          port: 8080
 ```
 
 Notes:
 
 - Replace the `OPENTELEMETRY_COLLECTOR_HTTP_LOGS` URL with your collector. The example logs only; traces and metrics endpoints stay empty unless you need them.
-- Add `WEBHOOK_RATE_LIMIT_PER_MINUTE` (default `600`), `WEBHOOK_AUTHORIZATION_HEADER` (default empty, authentication disabled) or `TRUST_PROXY` (default empty) to the `config.json` key, or set them as environment variables on the container, to change the matching defaults.
+- Add `WEBHOOK_RATE_LIMIT_PER_MINUTE` (default `600`), `WEBHOOK_AUTH_REQUIRED` (default `false`) or `TRUST_PROXY` (default empty) to the `config.json` key, or set them as environment variables on the container, to change the matching defaults. The two authorization headers (`WEBHOOK_AUTHORIZATION_HEADER`, `OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER`) are secrets: provide them only as environment variables — from a Kubernetes Secret via `secretKeyRef`/`envFrom`, or the shell/`.env` file with Docker Compose — never in a ConfigMap or `config.json`.
 - Configuration is read once at startup and there is **no live reload**. After changing the ConfigMap or the environment, run `kubectl rollout restart deployment/fluxcd-notifications-otel-adapter`.
 - The ConfigMap is mounted with `subPath` because there is no live reload; that is also why ConfigMap updates are not picked up in place.
 - `GET /api/status` reports `{"started": true, "version": "<version>"}` and is used by the probes.
@@ -349,12 +403,15 @@ Configuration can be provided as environment variables or through `config.json`.
 | `OPENTELEMETRY_COLLECTOR_HTTP_LOGS`                     | OTEL collector endpoint for logs                                            | (empty)               | Config file or environment variable |
 | `OPENTELEMETRY_COLLECTOR_EXPORT_LOGS_INTERVAL_SECONDS`  | Maximum delay before buffered logs are exported                             | `60`                  | Config file or environment variable |
 | `OPENTELEMETRY_COLLECTOR_EXPORT_METRICS_INTERVAL_SECONDS` | Interval used to export metrics                                           | `60`                  | Config file or environment variable |
-| `OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER`            | Token sent to the collector as `Authorization: Bearer <value>`              | (empty)               | Config file or environment variable |
-| `WEBHOOK_AUTHORIZATION_HEADER`                          | Expected `Authorization` header on webhook events (sensitive)               | (empty)               | Config file or environment variable |
+| `OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER`            | Token sent to the collector as `Authorization: Bearer <value>` (sensitive)  | (empty)               | Environment variable only           |
+| `WEBHOOK_AUTHORIZATION_HEADER`                          | Expected `Authorization` header on webhook events (sensitive)               | (empty)               | Environment variable only           |
+| `WEBHOOK_AUTH_REQUIRED`                                 | Fail closed: refuse startup when the webhook header is empty                | `false`               | Config file or environment variable |
 | `WEBHOOK_RATE_LIMIT_PER_MINUTE`                         | Per-client-IP rate limit on every route; `0` disables the limiter           | `600`                 | Config file or environment variable |
 | `TRUST_PROXY`                                           | Client-IP model: empty/false (direct peer), `true`, or trusted proxy IPs/CIDRs | (empty)            | Config file or environment variable |
 
 `OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER` takes the token only; the adapter adds the `Bearer ` prefix.
+
+The two authorization headers are secrets: provide them only as environment variables (in Kubernetes, from a Secret via `secretKeyRef`/`envFrom`), never in a ConfigMap or `config.json`.
 
 Sensitive values are masked as `********************` in the configuration log output.
 
@@ -373,11 +430,13 @@ Fixed limits (not configurable):
 
 ## Securing the webhook endpoint
 
-Authentication is **fail-open by default**: when `WEBHOOK_AUTHORIZATION_HEADER` is empty, any request is accepted. The adapter logs a startup warning (`webhook authentication disabled: WEBHOOK_AUTHORIZATION_HEADER is not set`) so the disabled state is visible.
+Authentication is **fail-open by default** (`WEBHOOK_AUTH_REQUIRED=false`): when `WEBHOOK_AUTHORIZATION_HEADER` is empty, any request is accepted. This backward-compatible default should **not** be used in production. The adapter logs a startup warning (`webhook authentication disabled: WEBHOOK_AUTHORIZATION_HEADER is not set and WEBHOOK_AUTH_REQUIRED is false (backward-compatible fail-open)`) so the disabled state is visible.
 
-When `WEBHOOK_AUTHORIZATION_HEADER` is set, `POST /` requires the exact same `Authorization` header (timing-safe comparison). A missing or wrong header gets `401` with `WWW-Authenticate: Bearer` and counts as `rejected_events_total{reason="unauthorized"}`. The check runs in the `onRequest` phase before body parsing, so an unauthenticated request with a malformed or oversized body still gets `401` rather than `400`/`413`.
+Set `WEBHOOK_AUTH_REQUIRED=true` to make the posture explicit and fail closed: the adapter then **refuses to start** when `WEBHOOK_AUTHORIZATION_HEADER` is not set, instead of silently running unauthenticated. In Kubernetes the failure surfaces even earlier: the pod stays in `CreateContainerConfigError` because the Deployment references the Secret with `secretKeyRef` (the shipped examples enable the switch).
 
-The Flux generic `Provider` adds HTTP headers from the `headers` key of its `secretRef` Secret, so a shared secret is configured like this:
+Authentication is active whenever `WEBHOOK_AUTHORIZATION_HEADER` is set, regardless of `WEBHOOK_AUTH_REQUIRED`: `POST /` requires the exact same `Authorization` header (timing-safe comparison). A missing or wrong header gets `401` with `WWW-Authenticate: Bearer` and counts as `rejected_events_total{reason="unauthorized"}`. The check runs in the `onRequest` phase before body parsing, so an unauthenticated request with a malformed or oversized body still gets `401` rather than `400`/`413`.
+
+The Flux generic `Provider` adds HTTP headers from the `headers` key of its `secretRef` Secret, so a shared secret is configured like this (placeholders only — create real Secrets with `kubectl create secret` or your secret manager and never commit them):
 
 ```yaml
 apiVersion: notification.toolkit.fluxcd.io/v1beta3
@@ -398,17 +457,29 @@ metadata:
   namespace: flux-system
 stringData:
   headers: |
-    Authorization: Bearer s3cr3t
+    Authorization: Bearer <shared-secret>
+---
+# The matching adapter Secret, referenced by the Deployment's secretKeyRef
+# (see the deployment examples in docs/deployments/kubernetes/kubernetes).
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fluxcd-notifications-otel-adapter-secret
+  namespace: fluxcd-notifications-otel-adapter
+stringData:
+  WEBHOOK_AUTHORIZATION_HEADER: Bearer <shared-secret>
 ```
 
-with `WEBHOOK_AUTHORIZATION_HEADER: "Bearer s3cr3t"` in the adapter configuration.
+The two `Bearer <shared-secret>` values must be identical.
+
+Rotating the secret: update the adapter Secret (and the Flux Provider Secret), then run `kubectl rollout restart deployment/fluxcd-notifications-otel-adapter` — configuration and Secret values are read once at startup, there is no live reload.
 
 Recommended production posture:
 
-- enable the shared secret and rotate it periodically;
-- terminate TLS at an HTTPS ingress and restrict access with network policies — the adapter itself serves plain HTTP;
+- set `WEBHOOK_AUTH_REQUIRED=true`, keep the shared secret in a Secret (never in a ConfigMap or `config.json`) and rotate it periodically;
+- terminate TLS at an HTTPS ingress and restrict access with network policies (see [NetworkPolicy](#networkpolicy)) — the adapter itself serves plain HTTP;
 - keep the in-process rate limiter as one layer and also rate-limit at the ingress, because the in-process limiter has no global cap;
-- changing the header, the rate limit or `TRUST_PROXY` requires a restart (`kubectl rollout restart`).
+- changing the header, the rate limit, `WEBHOOK_AUTH_REQUIRED` or `TRUST_PROXY` requires a restart (`kubectl rollout restart`).
 
 ### Client IP model and ingress contract
 
@@ -430,13 +501,21 @@ Behind an ingress every request can share the ingress pod IP when `TRUST_PROXY` 
 
 The limiter never keys on the authorization token: the token is shared by every Flux event, so one bucket would couple all clients.
 
+### NetworkPolicy
+
+The Kustomize base includes a [NetworkPolicy](docs/deployments/kubernetes/kubernetes/base/networkpolicy.yaml) that only allows ingress to port 8080 from pods labelled `app: notification-controller` in the namespace `flux-system` — the default Flux installation. Adjust the `namespaceSelector`/`podSelector` if Flux runs elsewhere.
+
+- HTTP probes (`GET /api/status`) keep working: kubelet probe traffic to/from the pod's node is exempt from NetworkPolicy, and NetworkPolicy cannot restrict by HTTP path (that would require an L7 policy, out of scope here).
+- To allow an ingress controller (or any other source), add an entry to `ingress.from` — for example an `ipBlock` with the ingress pod CIDR, or a namespace/pod selector matching the controller.
+- The [NodePort overlay](docs/deployments/kubernetes/kubernetes-nodeport) is blocked by this policy by default: NodePort clients come from outside the cluster and no `flux-system` pod is on the path. Add an explicit allow rule (e.g. an `ipBlock` for the client range) if you need NodePort access.
+
 ## Operations
 
 To verify the adapter is forwarding:
 
 - `kubectl logs -n fluxcd-notifications-otel-adapter deploy/fluxcd-notifications-otel-adapter` — each accepted event prints a `[level] [fluxcd-notifications] …` line;
 - query otel-light for the service name `fluxcd-notifications`, e.g. `GET /api/analytics/logs?serviceName=fluxcd-notifications&keywords=<cluster>`;
-- `GET /api/status` returns `{"started": true, "version": "0.11.0"}`.
+- `GET /api/status` returns `{"started": true, "version": "0.12.0"}`.
 
 Useful alerts:
 
@@ -444,7 +523,7 @@ Useful alerts:
 - growth of `rejected_events_total{reason="unauthorized"}` (misconfigured secret) or other rejection reasons;
 - sustained `429` responses (`rejected_events_total{reason="rate_limited"}`), which mean the limit or the ingress fan-in needs review.
 
-When correlating with traces, select on the `trace.id`/`span.id` attributes; that is the convention otel-light uses for adapter logs.
+When correlating with traces, select on the `trace.id`/`span.id` attributes; that is the convention otel-light uses for adapter logs. The attributes carry the request span IDs, which are only joinable to actual traces when `OPENTELEMETRY_COLLECTOR_HTTP_TRACES` is configured: with no traces endpoint, no spans are exported and the IDs cannot be joined to a trace.
 
 ## Startup and packaging
 

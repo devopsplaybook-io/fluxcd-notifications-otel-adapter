@@ -126,6 +126,15 @@ export async function start(options?: AppOptions): Promise<FastifyInstance> {
   const config = new Config();
   await config.reload();
 
+  // Fail closed before any server or telemetry setup when authentication is
+  // required but not configured: a production deployment must not silently
+  // run unauthenticated.
+  if (config.WEBHOOK_AUTH_REQUIRED && !config.WEBHOOK_AUTHORIZATION_HEADER) {
+    throw new Error(
+      "WEBHOOK_AUTH_REQUIRED is enabled but WEBHOOK_AUTHORIZATION_HEADER is not set; refusing to start with webhook authentication disabled",
+    );
+  }
+
   // Configuration is read once here and the OTel providers are built from it,
   // so changing config.json or environment variables requires a restart
   // (Kubernetes subPath ConfigMap mounts are not updated in place either).
@@ -135,11 +144,16 @@ export async function start(options?: AppOptions): Promise<FastifyInstance> {
 
   logger.info("====== Starting fluxcd-notifications-otel-adapter Server ======");
 
-  // Fail-open is kept for backward compatibility (the live deployment has no
-  // auth header configured): make the disabled authentication visible.
-  if (!config.WEBHOOK_AUTHORIZATION_HEADER) {
+  // Authentication is active whenever the header is set; WEBHOOK_AUTH_REQUIRED
+  // only makes the requirement explicit and fail-closed. The fail-open default
+  // is kept for backward compatibility (the live deployment has no auth header).
+  if (config.WEBHOOK_AUTH_REQUIRED) {
+    logger.info("webhook authentication required and enabled");
+  } else if (config.WEBHOOK_AUTHORIZATION_HEADER) {
+    logger.info("webhook authentication enabled (WEBHOOK_AUTH_REQUIRED=false)");
+  } else {
     logger.warn(
-      "webhook authentication disabled: WEBHOOK_AUTHORIZATION_HEADER is not set",
+      "webhook authentication disabled: WEBHOOK_AUTHORIZATION_HEADER is not set and WEBHOOK_AUTH_REQUIRED is false (backward-compatible fail-open)",
     );
   }
   const rateLimitPerMinute = resolveRateLimitPerMinute(

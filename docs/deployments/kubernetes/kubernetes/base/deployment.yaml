@@ -28,6 +28,20 @@ spec:
       containers:
         - image: fluxcd-notifications-otel-adapter
           name: fluxcd-notifications-otel-adapter
+          # Authorization headers are secrets: they must come from a Secret
+          # (secretKeyRef), never from a ConfigMap or config.json.
+          env:
+            - name: WEBHOOK_AUTHORIZATION_HEADER
+              valueFrom:
+                secretKeyRef:
+                  name: fluxcd-notifications-otel-adapter-secret
+                  key: WEBHOOK_AUTHORIZATION_HEADER
+            - name: OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER
+              valueFrom:
+                secretKeyRef:
+                  name: fluxcd-notifications-otel-adapter-secret
+                  key: OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER
+                  optional: true
           securityContext:
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true

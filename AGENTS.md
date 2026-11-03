@@ -26,7 +26,7 @@ fluxcd-notifications-otel-adapter/
     TrustProxy.spec.ts    # TRUST_PROXY parsing tests
   config.json             # Default runtime configuration (empty object)
   Dockerfile              # Multi-stage build (node:26-alpine)
-  docs/                   # Deployment examples (Kubernetes/Kustomize, Docker Compose)
+  docs/                   # Deployment examples (Kubernetes/Kustomize with NetworkPolicy, Docker Compose)
 ```
 
 ## Coding Conventions
@@ -60,6 +60,7 @@ Importing the `common-utils` barrel loads its full database and authentication s
 `src/Config.ts` extends `ConfigBase` with `serviceId = "fluxcd-notifications"`. Project-specific fields are registered with `addConfigField` in the constructor:
 
 - `WEBHOOK_AUTHORIZATION_HEADER` — optional shared-secret check on `POST /` (sensitive, masked in logs)
+- `WEBHOOK_AUTH_REQUIRED` — boolean, default `false`: when `true`, startup refuses to continue if `WEBHOOK_AUTHORIZATION_HEADER` is empty (fail closed); when `false`, an empty header only logs a warning (backward-compatible fail-open)
 - `WEBHOOK_RATE_LIMIT_PER_MINUTE` — per-client-IP limit on every route, default `600`, `0` disables the limiter
 - `TRUST_PROXY` — Fastify client-IP model, empty by default (direct peer); `true` or a comma-separated list of IPs/CIDRs/keywords (`loopback`, `linklocal`, `uniquelocal`); an invalid value fails startup
 
@@ -69,7 +70,7 @@ The constructor also overrides `VERSION` with the application's `package.json` v
 
 1. FluxCD sends a POST to `/` with the Kubernetes Event object (severity, message, reason, involvedObject, metadata, reportingController, timestamp)
 2. Rate limiting runs first in the Fastify `onRequest` phase, before body parsing and before authentication. The limiter is a **root hook**, so it covers every route including `/api/status` and unknown routes (404s): `WEBHOOK_RATE_LIMIT_PER_MINUTE` per client IP in a fixed 60 s window (at most 10 000 tracked clients); over the limit → `429` + `Retry-After`, counted as `rate_limited`. The bucket key is the resolved client IP (never the shared authorization token); with `TRUST_PROXY` set, `request.ip` comes from `X-Forwarded-For` only for trusted peers, and a malformed value falls back to the socket address
-3. Authentication runs in the same `onRequest` phase, still before body parsing: when `WEBHOOK_AUTHORIZATION_HEADER` is set, the request must carry the exact same `Authorization` header (timing-safe, `401` + `WWW-Authenticate: Bearer` otherwise). An unauthenticated malformed or oversized body therefore gets `401`, not `400`/`413`
+3. Authentication runs in the same `onRequest` phase, still before body parsing: when `WEBHOOK_AUTHORIZATION_HEADER` is set, the request must carry the exact same `Authorization` header (timing-safe, `401` + `WWW-Authenticate: Bearer` otherwise). An unauthenticated malformed or oversized body therefore gets `401`, not `400`/`413`. Authentication is active whenever the header is set regardless of `WEBHOOK_AUTH_REQUIRED`; the switch only adds a fail-closed startup guard (refuses to start when required but the header is empty). The authorization headers are secrets provided as environment variables (in Kubernetes via `secretKeyRef` from a Secret), never from `config.json` or a ConfigMap
 4. Fastify rejects oversized bodies (`413`, 64 KiB limit) and unsupported content types (`415`) before the handler runs
 5. The handler requires only a non-empty `message`: a missing/blank message is `400 invalid_payload`. `reason` and `metadata.cluster` default to `unknown`; a non-string `severity` is treated as absent (`unknown`) without failing the request
 6. Accepted events are emitted as one OTel log record via `StandardLogger.getLogger().emit()` when a logs endpoint is configured: severity mapped from the Flux severity (info→INFO, error→ERROR, warn/warning→WARN, else INFO), body `<cluster>: <reason> - <message>`, and `flux.*` attributes (cluster, reason, severity, object kind/name/namespace/apiVersion/uid, revision, reporting_controller, `flux.message.truncated`, `flux.attributes.truncated` when applicable) with the request OTel context attached. A console line `[level] [fluxcd-notifications] <body>` is always printed; with no logs endpoint the event goes to the console only through the module logger. Every input-derived string attribute is capped at 256 code points (code-point aware, never splitting a surrogate pair)
@@ -114,11 +115,12 @@ Key inherited configuration values from `ConfigBase`:
 - `OPENTELEMETRY_COLLECTOR_HTTP_LOGS` — OTel collector logs endpoint (empty = console only)
 - `OPENTELEMETRY_COLLECTOR_EXPORT_LOGS_INTERVAL_SECONDS` — log export interval (default: `60`, and the batch flush delay)
 - `OPENTELEMETRY_COLLECTOR_EXPORT_METRICS_INTERVAL_SECONDS` — metrics export interval (default: `60`)
-- `OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER` — token sent to the collector as `Authorization: Bearer <value>` (sensitive, masked in logs)
+- `OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER` — token sent to the collector as `Authorization: Bearer <value>` (sensitive, masked in logs); a secret: environment variable only (Kubernetes Secret), never in a config file
 
 Project-specific configuration values:
 
-- `WEBHOOK_AUTHORIZATION_HEADER` — when set, `POST /` requires the exact same `Authorization` header (401 otherwise); empty by default (no auth, startup warning)
+- `WEBHOOK_AUTHORIZATION_HEADER` — when set, `POST /` requires the exact same `Authorization` header (401 otherwise); empty by default (no auth, startup warning); a secret: environment variable only (Kubernetes Secret via `secretKeyRef`), never in a config file or ConfigMap
+- `WEBHOOK_AUTH_REQUIRED` — boolean, default `false`; when `true`, startup refuses to continue if `WEBHOOK_AUTHORIZATION_HEADER` is empty (fail closed); when `false`, an empty header only logs a warning (backward-compatible fail-open)
 - `WEBHOOK_RATE_LIMIT_PER_MINUTE` — per-client-IP limit over a fixed 60 s window on every route; default `600`, `0` disables
 - `TRUST_PROXY` — client-IP model; empty by default (direct peer), `true` (trusts every `X-Forwarded-For`), or a comma-separated list of trusted proxy IPs/CIDRs/keywords
 
@@ -128,13 +130,14 @@ Project-specific configuration values:
 - Runtime command: `node dist/App.js` (explicit `CMD ["node", "dist/App.js"]`)
 - Runs as `USER node` (UID 1000) and works with a read-only root filesystem; only `/tmp` needs a writable volume
 - Production dependency tree is about 137 packages; config is mounted at `/opt/app/config.json` via a Kubernetes ConfigMap
+- Kubernetes examples inject the authorization headers from a Secret via `secretKeyRef` (`WEBHOOK_AUTHORIZATION_HEADER` mandatory — the pod fails with `CreateContainerConfigError` until the Secret exists; `OPENTELEMETRY_COLLECT_AUTHORIZATION_HEADER` optional) and include a NetworkPolicy restricting ingress on port 8080 to the Flux notification-controller (namespace `flux-system`, pod label `app: notification-controller`); kubelet probe traffic is exempt from NetworkPolicy, so `/api/status` probes keep working, and the NodePort overlay is blocked by the policy until an explicit allow rule is added
 
 ## CI/CD
 
 GitHub Actions workflows use reusable workflows from `devopsplaybook-io/common-utils`:
 
 - `pr-check.yml` — runs on PR to `main`: version check, `npm ci`, build, lint, test, coverage upload, audit gate (high/critical production advisories) and Docker build/push of `beta-pr-<n>` and `beta`
-- `main-build.yml` — runs on merge to `main`: audit and promotion of the exact PR-validated image to `0.11.0`, `0.11`, `0`, `latest` and `beta` (no rebuild)
+- `main-build.yml` — runs on merge to `main`: audit and promotion of the exact PR-validated image to `0.12.0`, `0.12`, `0`, `latest` and `beta` (no rebuild)
 
 ## Post-Change Validation
 
@@ -146,7 +149,7 @@ npm run lint     # oxlint check
 npm test         # Jest tests with coverage
 ```
 
-All three must pass. Jest enforces global coverage thresholds of 85% statements, 80% branches, 85% functions and 85% lines (`jest.config.js`). Current numbers on `main`: 194 tests, 97.61% statements/lines, 94.02% branches, 100% functions.
+All three must pass. Jest enforces global coverage thresholds of 85% statements, 80% branches, 85% functions and 85% lines (`jest.config.js`). Current numbers on `main`: 200 tests, 97.65% statements/lines, 94.16% branches, 100% functions.
 
 For changes touching deployment examples or documentation paths, also verify the Kustomize output still builds:
 
