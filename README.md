@@ -180,7 +180,7 @@ The adapter prints `[info] [fluxcd-notifications] my-cluster: ReconciliationSucc
 
 This adapter is meant to be deployed alongside your FluxCD installation in Kubernetes.
 
-The Kustomize base in [docs/deployments/kubernetes/kubernetes](docs/deployments/kubernetes/kubernetes) is the authoritative example; the [kubernetes-nodeport](docs/deployments/kubernetes/kubernetes-nodeport) overlay changes only the Service type. It deploys the image pinned to `0.14.0`, enables the logs collector, leaves the traces and metrics endpoints empty, requires the webhook Secret to be created before applying the manifests (`WEBHOOK_AUTH_REQUIRED=true`) and includes a NetworkPolicy (see [Securing the webhook endpoint](#securing-the-webhook-endpoint)).
+The Kustomize base in [docs/deployments/kubernetes/kubernetes](docs/deployments/kubernetes/kubernetes) is the authoritative example; the [kubernetes-nodeport](docs/deployments/kubernetes/kubernetes-nodeport) overlay changes only the Service type. It deploys the image pinned to `0.14.1`, enables the logs collector, leaves the traces and metrics endpoints empty, requires the webhook Secret to be created before applying the manifests (`WEBHOOK_AUTH_REQUIRED=true`) and includes a NetworkPolicy (see [Securing the webhook endpoint](#securing-the-webhook-endpoint)).
 
 ### Kustomize
 
@@ -269,7 +269,7 @@ spec:
         seccompProfile:
           type: RuntimeDefault
       containers:
-        - image: devopsplaybookio/fluxcd-notifications-otel-adapter:0.14.0
+        - image: devopsplaybookio/fluxcd-notifications-otel-adapter:0.14.1
           name: fluxcd-notifications-otel-adapter
           # Authorization headers are secrets: they must come from a Secret
           # (secretKeyRef), never from a ConfigMap or config.json.
@@ -516,7 +516,7 @@ To verify the adapter is forwarding:
 
 - `kubectl logs -n fluxcd-notifications-otel-adapter deploy/fluxcd-notifications-otel-adapter` — each accepted event prints a `[level] [fluxcd-notifications] …` line unless `OPENTELEMETRY_CONSOLE_LOG_MODE` is `fallback` with a collector configured or `never`;
 - query otel-light for the service name `fluxcd-notifications`, e.g. `GET /api/analytics/logs?serviceName=fluxcd-notifications&keywords=<cluster>`;
-- `GET /api/status` returns `{"started": true, "version": "0.14.0"}`.
+- `GET /api/status` returns `{"started": true, "version": "0.14.1"}`.
 
 Useful alerts:
 

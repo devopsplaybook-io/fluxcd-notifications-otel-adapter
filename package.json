@@ -1,6 +1,6 @@
 {
   "name": "fluxcd-notifications-otel-adapter",
-  "version": "0.14.0",
+  "version": "0.14.1",
   "author": "",
   "license": "MIT",
   "engines": {
@@ -16,20 +16,20 @@
     "dev:test": "NODE_ENV=dev jest --watch --config='jest.config.js'"
   },
   "dependencies": {
-    "@devopsplaybook.io/common-utils": "^2.4.1",
-    "@devopsplaybook.io/otel-utils": "^1.9.1",
-    "@devopsplaybook.io/otel-utils-fastify": "^1.7.1",
+    "@devopsplaybook.io/common-utils": "^2.9.2",
+    "@devopsplaybook.io/otel-utils": "^1.14.2",
+    "@devopsplaybook.io/otel-utils-fastify": "^1.11.2",
     "@opentelemetry/api-logs": "^0.223.0",
-    "fastify": "^5.12.7"
+    "fastify": "^5.12.8"
   },
   "devDependencies": {
-    "@opentelemetry/sdk-metrics": "^3.0.0",
-    "@swc/core": "^1.16.21",
+    "@opentelemetry/sdk-metrics": "^3.1.1",
+    "@swc/core": "^1.16.22",
     "@swc/jest": "^0.2.39",
     "@types/jest": "^30.0.0",
     "@types/node": "^26.6.6",
     "jest": "^30.5.2",
-    "oxlint": "^1.90.0",
+    "oxlint": "^1.93.0",
     "tsx": "^4.23.15",
     "typescript": "^7.0.2"
   }

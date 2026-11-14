@@ -68,7 +68,7 @@ Always import from the subpaths, never the barrel: `ConfigBase` from `@devopspla
 - `TRUST_PROXY` — Fastify client-IP model, empty by default (direct peer); `true` or a comma-separated list of IPs/CIDRs/keywords (`loopback`, `linklocal`, `uniquelocal`); an invalid value fails startup
 - `OPENTELEMETRY_CONSOLE_LOG_MODE` — console mirroring for module-logger records, default `always`; `fallback` mirrors only when no logs endpoint is configured, `never` suppresses; an invalid value behaves like `always`. Applies to accepted-event lines and, through the module logger, rejection lines
 
-The constructor also overrides `VERSION` with the application's `package.json` version (`ConfigBase` otherwise reports the shared library's version, which breaks release identification in telemetry). The `reload()` method delegates to `super.reload()` with a logger callback; it is only called during startup.
+The constructor also overrides `VERSION` with the application's `package.json` version (`ConfigBase` otherwise reports the shared library's version, which breaks release identification in telemetry) and re-registers the field with `addConfigField({ field: "VERSION" })`: since `common-utils` 2.7.0, `reload()` restores every registered field to the default captured at registration, so without the re-registration the override would be reset to the library version on startup. The `reload()` method delegates to `super.reload()` with a logger callback; it is only called during startup.
 
 ### Request Flow
 
@@ -142,7 +142,7 @@ Project-specific configuration values:
 GitHub Actions workflows use reusable workflows from `devopsplaybook-io/common-utils`:
 
 - `pr-check.yml` — runs on PR to `main`: version check, `npm ci`, build, lint, test, coverage upload, audit gate (high/critical production advisories) and Docker build/push of `beta-pr-<n>` and `beta`
-- `main-build.yml` — runs on merge to `main`: audit and promotion of the exact PR-validated image to `0.14.0`, `0.14`, `0`, `latest` and `beta` (no rebuild)
+- `main-build.yml` — runs on merge to `main`: audit and promotion of the exact PR-validated image to `0.14.1`, `0.14`, `0`, `latest` and `beta` (no rebuild)
 
 ## Post-Change Validation
 
@@ -154,7 +154,7 @@ npm run lint     # oxlint check
 npm test         # Jest tests with coverage
 ```
 
-All three must pass. Jest enforces global coverage thresholds of 85% statements, 80% branches, 85% functions and 85% lines (`jest.config.js`). Current numbers on `main`: 207 tests, 98.09% statements/lines, 94.13% branches, 100% functions.
+All three must pass. Jest enforces global coverage thresholds of 85% statements, 80% branches, 85% functions and 85% lines (`jest.config.js`). Current numbers on `main`: 208 tests, 98.09% statements/lines, 94.13% branches, 100% functions.
 
 For changes touching deployment examples or documentation paths, also verify the Kustomize output still builds:
 
