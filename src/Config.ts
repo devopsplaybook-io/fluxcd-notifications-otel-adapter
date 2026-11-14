@@ -32,8 +32,11 @@ export class Config extends ConfigBase {
     this.addConfigField({ field: "TRUST_PROXY" });
     this.addConfigField({ field: "OPENTELEMETRY_CONSOLE_LOG_MODE" });
     // ConfigBase defaults VERSION to the shared library's version; telemetry
-    // must report this application's version instead.
+    // must report this application's version instead. Since common-utils 2.7.0
+    // reload() restores every registered field to the default captured at
+    // registration, the override is re-registered afterwards so reload keeps it.
     this.VERSION = APP_VERSION;
+    this.addConfigField({ field: "VERSION" });
   }
 
   public async reload(): Promise<void> {

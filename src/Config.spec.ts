@@ -139,6 +139,11 @@ describe("Config", () => {
       const config = new Config();
       expect(config.VERSION).toBe(packageVersion);
     });
+
+    it("should re-register VERSION so reload restores the application version, not the library default", () => {
+      new Config();
+      expect(capturedConfigFields).toContainEqual({ field: "VERSION" });
+    });
   });
 
   describe("reload", () => {

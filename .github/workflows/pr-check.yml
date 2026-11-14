@@ -15,7 +15,7 @@ permissions:
 
 jobs:
   pr-verify:
-    uses: devopsplaybook-io/common-utils/.github/workflows/reusable-pr-verify.yml@039402a1c1bc53a91546a7e126070e834a5d097a
+    uses: devopsplaybook-io/common-utils/.github/workflows/reusable-pr-verify.yml@fd596fb62a41c71f596e2714b5d35cbda31985d5
     with:
       node_app_directories: '["."]'
       node_version: "26"
